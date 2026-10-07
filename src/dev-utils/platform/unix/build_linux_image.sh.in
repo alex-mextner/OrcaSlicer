@@ -362,6 +362,12 @@ export APPDIR="\${APPDIR:-\$DIR}"
 # 1) OrcaSlicer will segfault on systems where locale info is not as expected (i.e. Holo-ISO arch-based distro)
 export LC_ALL=C
 
+# The statically linked OpenSSL looks for CAs under its build prefix; without SSL_CERT_FILE the app
+# finds the system bundle itself but asks for confirmation on every start. Point it there up front.
+if [ -z "\$SSL_CERT_FILE" ] && [ -r /etc/ssl/certs/ca-certificates.crt ]; then
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+fi
+
 if [ "\$XDG_SESSION_TYPE" = "wayland" ] && [ "\$ZINK_DISABLE_OVERRIDE" != "1" ]; then
     if command -v glxinfo >/dev/null 2>&1; then
         RENDERER=\$(glxinfo | grep "OpenGL renderer string:" | sed 's/.*: //')

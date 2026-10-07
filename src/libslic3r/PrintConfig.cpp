@@ -7744,11 +7744,13 @@ void DynamicPrintConfig::normalize_fdm(int used_filaments)
     }
 
     if (this->has("wipe_tower_filament")) {
-        // If invalid, replace with 0.
-        int extruder      = this->opt<ConfigOptionInt>("wipe_tower_filament")->value;
-        int num_extruders = this->opt<ConfigOptionFloats>("nozzle_diameter")->size();
-        if (extruder < 0 || extruder > num_extruders)
-            this->option("wipe_tower_filament")->setInt(0);
+        // If invalid, replace with 0. A process-only config has no nozzle_diameter to validate against.
+        int extruder = this->opt<ConfigOptionInt>("wipe_tower_filament")->value;
+        if (const auto *nozzle_diameter = this->opt<ConfigOptionFloats>("nozzle_diameter"); nozzle_diameter != nullptr) {
+            int num_extruders = int(nozzle_diameter->size());
+            if (extruder < 0 || extruder > num_extruders)
+                this->option("wipe_tower_filament")->setInt(0);
+        }
     }
 
     if (!this->has("solid_infill_filament") && this->has("sparse_infill_filament"))
@@ -7784,7 +7786,7 @@ void DynamicPrintConfig::normalize_fdm(int used_filaments)
 
         ConfigOptionEnum<TimelapseType>* timelapse_opt = this->option<ConfigOptionEnum<TimelapseType>>("timelapse_type");
         bool is_smooth_timelapse = timelapse_opt != nullptr && timelapse_opt->value == TimelapseType::tlSmooth;
-        if (!is_smooth_timelapse && (used_filaments == 1 || ps_opt->value == PrintSequence::ByObject)) {
+        if (!is_smooth_timelapse && (used_filaments == 1 || (ps_opt != nullptr && ps_opt->value == PrintSequence::ByObject))) {
             ept_opt->value = false;
         }
 

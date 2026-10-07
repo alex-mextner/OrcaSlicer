@@ -52,8 +52,11 @@ TEST_CASE("Mixed print uses the highest bed temperature", "[BedTemperature]")
 {
     DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
     config.set_num_extruders(2);
-    config.set_num_filaments(2);
+    // DynamicPrintConfig::set_num_filaments() is a no-op (PrintConfigDef never fills its filament key list),
+    // so size the per-filament options that Print uses to count filaments explicitly.
     config.set_deserialize_strict({
+        { "filament_diameter", "1.75,1.75" },
+        { "filament_colour", "#F2754E,#FFFFFF" },
         { "curr_bed_type", "High Temp Plate" },
         { "hot_plate_temp", "30,60" },
         { "hot_plate_temp_initial_layer", "35,65" },
@@ -73,8 +76,9 @@ TEST_CASE("Brim-introduced extruder is covered when wall_loops is zero", "[BedTe
 {
     DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
     config.set_num_extruders(2);
-    config.set_num_filaments(2);
     config.set_deserialize_strict({
+        { "filament_diameter", "1.75,1.75" },
+        { "filament_colour", "#F2754E,#FFFFFF" },
         { "curr_bed_type", "High Temp Plate" },
         { "hot_plate_temp", "30,60" },
         { "hot_plate_temp_initial_layer", "35,65" },
@@ -98,8 +102,9 @@ TEST_CASE("bed_temperature_initial_layer_single expands to the max", "[BedTemper
 {
     DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
     config.set_num_extruders(2);
-    config.set_num_filaments(2);
     config.set_deserialize_strict({
+        { "filament_diameter", "1.75,1.75" },
+        { "filament_colour", "#F2754E,#FFFFFF" },
         { "curr_bed_type", "High Temp Plate" },
         { "hot_plate_temp", "30,60" },
         { "hot_plate_temp_initial_layer", "35,65" },

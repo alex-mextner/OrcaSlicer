@@ -210,6 +210,19 @@ The `scripts/DockerRun.sh` script includes several commented-out options that ca
 
 By uncommenting and using these options as needed, you can often resolve issues related to display authorization, networking, and file permissions.
 
+### Ubuntu 26.04 (containerized build, native run)
+
+Ubuntu 26.04 ships CMake 4.x, which `build_linux.sh` rejects. `scripts/ubuntu2604/build.sh` builds inside an `ubuntu:26.04` container (CMake 3.30, all `-dev` packages) under your UID, with the repo mounted at the same absolute path. No host `sudo` is needed. The resulting binary links against the same system libraries as the host and runs natively.
+
+```shell
+scripts/ubuntu2604/build.sh          # deps + slicer: ./build_linux.sh -dsr
+scripts/ubuntu2604/build.sh -isr     # rebuild slicer + AppImage
+```
+
+Outputs: `build/package/snapmaker-orca` (run in place) and `build/Snapmaker_Orca_Linux_V*.AppImage`.
+Host runtime needs: `libgtk-3-0t64`, `libwebkit2gtk-4.1-0`, `libopengl0` (present on a stock desktop install).
+CLI thumbnails are skipped on 26.04: Mesa ≥ 25.1 no longer ships OSMesa. G-code and 3MF export are unaffected.
+
 ### Linux Build
 
 How to build OrcaSlicer on Linux.

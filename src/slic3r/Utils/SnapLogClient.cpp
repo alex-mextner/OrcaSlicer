@@ -252,6 +252,31 @@ std::string mask_secret_in_value(std::string v)
                                                             std::regex::icase),
                                                  // Email addresses
                                                  std::regex(R"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")};
+    // libstdc++'s std::regex matcher recurses once per character consumed by a
+    // quantifier, so scanning a long run of non-whitespace (the token patterns
+    // above all stop at whitespace) overflows the stack. Such runs are opaque
+    // blobs: mask them wholesale instead of scanning them.
+    static constexpr std::size_t kMaxScannedRun = 4096;
+    if (v.size() > kMaxScannedRun) {
+        auto is_ws = [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
+        std::string bounded;
+        bounded.reserve(v.size());
+        for (std::size_t i = 0; i < v.size();) {
+            std::size_t run_end = i;
+            while (run_end < v.size() && !is_ws(v[run_end]))
+                ++run_end;
+            if (run_end - i > kMaxScannedRun)
+                bounded += "***";
+            else
+                bounded.append(v, i, run_end - i);
+            std::size_t ws_end = run_end;
+            while (ws_end < v.size() && is_ws(v[ws_end]))
+                ++ws_end;
+            bounded.append(v, run_end, ws_end - run_end);
+            i = ws_end;
+        }
+        v = std::move(bounded);
+    }
     for (const auto& re : deny)
         v = std::regex_replace(v, re, "***");
     return v;
@@ -326,10 +351,10 @@ std::string render_realtime_body(
             sanitized = hash_pii(id.client_id, v);
         } else if (is_pii_key(key)) {
             sanitized.clear();
-        } else if (looks_like_path(v)) {
-            sanitized = mask_secret_in_value(redact_path(id.home_for_redact, v));
         } else {
-            sanitized = mask_secret_in_value(v);
+            // Only the first kMaxExtValueBytes survive; don't regex-scan the rest.
+            const std::string head = utf8_safe_prefix(v, std::min(v.size(), 2 * kMaxExtValueBytes));
+            sanitized = looks_like_path(head) ? mask_secret_in_value(redact_path(id.home_for_redact, head)) : mask_secret_in_value(head);
         }
         sanitized = utf8_safe_prefix(sanitized, sanitized.size());
         if (sanitized.size() <= kMaxExtValueBytes)
@@ -600,11 +625,11 @@ std::string render_batch_line(
             out_val = hash_pii(ctx.clientId, v);
         } else if (is_pii_key(key)) {
             out_val.clear();
-        } else if (looks_like_path(v)) {
-            // Path-like: redact home prefix, then mask any remaining secrets.
-            out_val = mask_secret_in_value(redact_path(ctx.home_for_redact, v));
         } else {
-            out_val = mask_secret_in_value(v);
+            // Only the first kMaxExtValueBytes survive; don't regex-scan the rest.
+            // Path-like: redact home prefix, then mask any remaining secrets.
+            const std::string head = utf8_safe_prefix(v, std::min(v.size(), 2 * kMaxExtValueBytes));
+            out_val = looks_like_path(head) ? mask_secret_in_value(redact_path(ctx.home_for_redact, head)) : mask_secret_in_value(head);
         }
         // Per-value truncation.
         out_val = utf8_safe_prefix(out_val, out_val.size());
