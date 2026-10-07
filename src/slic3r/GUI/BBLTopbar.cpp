@@ -11,6 +11,10 @@
 #include "WebViewDialog.hpp"
 #include "PartPlate.hpp"
 
+#ifdef __WXGTK__
+#include <gtk/gtk.h>
+#endif
+
 #include <boost/log/trivial.hpp>
 
 #define TOPBAR_ICON_SIZE  18
@@ -532,6 +536,17 @@ void BBLTopbar::OnIconize(wxAuiToolBarEvent& event)
 
 void BBLTopbar::OnFullScreen(wxAuiToolBarEvent& event)
 {
+#ifdef __WXGTK__
+    // The frame is undecorated: let the window manager do the (un)maximize.
+    GtkWindow* gtk_window = GTK_WINDOW(m_frame->m_widget);
+    if (gtk_window_is_maximized(gtk_window)) {
+        gtk_window_unmaximize(gtk_window);
+    } else {
+        m_normalRect = m_frame->GetRect();
+        gtk_window_maximize(gtk_window);
+    }
+    return;
+#endif
     if (m_frame->IsMaximized()) {
         m_frame->Restore();
     }
@@ -624,12 +639,18 @@ void BBLTopbar::OnMouseLeftDown(wxMouseEvent& event)
     if (FindToolByCurrentPosition() == NULL 
         || this->FindToolByCurrentPosition() == m_title_item)
     {
-        CaptureMouse();
 #ifdef __WXMSW__
+        CaptureMouse();
         ReleaseMouse();
         ::PostMessage((HWND) m_frame->GetHandle(), WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(mouse_pos.x, mouse_pos.y));
         return;
-#endif //  __WXMSW__
+#elif defined(__WXGTK__)
+        // WM-integrated drag: works for the undecorated frame, including restore-from-maximized.
+        gtk_window_begin_move_drag(GTK_WINDOW(m_frame->m_widget), 1, mouse_pos.x, mouse_pos.y, gtk_get_current_event_time());
+        return;
+#else
+        CaptureMouse();
+#endif
     }
     
     event.Skip();
