@@ -221,7 +221,22 @@ scripts/ubuntu2604/build.sh -isr     # rebuild slicer + AppImage
 
 Outputs: `build/package/snapmaker-orca` (run in place) and `build/Snapmaker_Orca_Linux_V*.AppImage`.
 Host runtime needs: `libgtk-3-0t64`, `libwebkit2gtk-4.1-0`, `libopengl0` (present on a stock desktop install).
-CLI thumbnails are skipped on 26.04: Mesa ≥ 25.1 no longer ships OSMesa. G-code and 3MF export are unaffected.
+
+#### Command-line slicing
+
+`--load-settings`/`--load-filaments` read a preset file as-is and do not follow `inherits`, so system presets must be flattened first (otherwise inherited values such as `filament_density` are missing):
+
+```shell
+scripts/flatten_profile.py -o /tmp/u1 \
+    --machine "Snapmaker U1 (0.4 nozzle)" \
+    --process "0.20mm Standard @Snapmaker U1 (0.4 nozzle)" \
+    --filament "Snapmaker PLA Basic @U1"
+build/package/snapmaker-orca --slice 0 --outputdir out --export-3mf out.3mf \
+    --load-settings "/tmp/u1/machine-Snapmaker U1 (0.4 nozzle).json;/tmp/u1/process-0.20mm Standard @Snapmaker U1 (0.4 nozzle).json" \
+    --load-filaments "/tmp/u1/filament-Snapmaker PLA Basic @U1.json" model.stl
+```
+
+The CLI skips plate thumbnails on Linux: it renders them through an OSMesa context, and the bundled GLEW cannot initialize on one (even with `libosmesa6` installed). G-code and 3MF are otherwise complete. If the printer screen needs a preview image, slice in the GUI, which renders thumbnails with the regular OpenGL context.
 
 ### Linux Build
 
