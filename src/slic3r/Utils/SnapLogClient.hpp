@@ -443,6 +443,10 @@ public:
     bool auth_known_dead_for_test() const;
     void set_auth_known_dead_for_test(bool v);
 
+    // Test-only: while paused, the realtime worker neither pops nor sends, so tests of log()
+    // admission (queue size, eviction, drops) do not race with delivery. No-op when un-init'd.
+    void pause_realtime_worker_for_test(bool paused);
+
     // Test-only: override the nonce generator used by the worker so X-Sign is
     // deterministic in tests. Pass an empty function to restore the default
     // (RAND_bytes). No-op when un-init'd.
@@ -506,6 +510,7 @@ public:
         std::atomic<bool>     consent{true};
         std::atomic<bool>     stop_receiving{true}; // true until init() flips it
         std::atomic<bool>     deps_invalid{false};
+        std::atomic<bool>     rt_paused_for_test{false};
         std::atomic<uint64_t> dropped{0};
 
         // --- Identity (guarded by token_mu) ---

@@ -3,6 +3,7 @@
 #include "FilamentColorUtils.hpp"
 #include "GUI_App.hpp"
 #include "MainFrame.hpp"
+#include "LanAutoConnect.hpp"
 #include "DownloadManager.hpp"
 #include "Timelapse/TimelapseDownloadPopup.hpp"
 #include "nlohmann/json.hpp"
@@ -6411,6 +6412,8 @@ void SSWCP_MachineManage_Instance::sw_DeleteDevices()
                     }
                 }
                 wxGetApp().app_config->clear_device_info();
+                wxGetApp().app_config->set("last_connected_device", "");
+                wxGetApp().app_config->set("last_connected_ca_sha256", "");
             } else {
                 for (size_t i = 0; i < ids.size(); ++i) {
                     std::string dev_id = ids[i].get<std::string>();
@@ -6426,6 +6429,10 @@ void SSWCP_MachineManage_Instance::sw_DeleteDevices()
                         }
                     }
                     wxGetApp().app_config->remove_device_info(dev_id);
+                    if (wxGetApp().app_config->get("last_connected_device") == dev_id) {
+                        wxGetApp().app_config->set("last_connected_device", "");
+                        wxGetApp().app_config->set("last_connected_ca_sha256", "");
+                    }
 
                 }
             }
@@ -7239,6 +7246,162 @@ void SSWCP_MqttAgent_Instance::sw_mqtt_unsubscribe() {
     }
 }
 
+void sm_lan_on_connection_lost()
+{
+    wxGetApp().CallAfter([]() {
+        SSWCP_Instance::m_first_connected = true;
+        wxGetApp().app_config->clear_filament_extruder_map();
+        wxGetApp().preset_bundle->machine_filaments.clear();
+        wxGetApp().load_current_presets();
+    });
+    wxGetApp().CallAfter([]() {
+        wxGetApp().app_config->set("use_new_connect", "false");
+        auto p_config = &(wxGetApp().preset_bundle->printers.get_edited_preset().config);
+        p_config->set("print_host", "");
+
+        std::shared_ptr<PrintHost> ptr = nullptr;
+        wxGetApp().get_connect_host(ptr);
+        if (ptr) {
+            wxString disconn_msg = "";
+            json     disconn_param;
+            ptr->disconnect(disconn_msg, disconn_param);
+        }
+
+        wxGetApp().set_connect_host(nullptr);
+
+        auto devices = wxGetApp().app_config->get_devices();
+        for (size_t i = 0; i < devices.size(); ++i) {
+            if (devices[i].connected) {
+                devices[i].connected = false;
+                wxGetApp().app_config->save_device_info(devices[i]);
+                break;
+            }
+        }
+
+        // update card
+        json param;
+        param["command"]       = "local_devices_arrived";
+        param["sequece_id"]    = "10001";
+        param["data"]          = devices;
+        std::string logout_cmd = param.dump();
+        wxString    strJS      = wxString::Format("window.postMessage(%s)", logout_cmd);
+        GUI::wxGetApp().run_script(strJS);
+
+        // wcp sub
+        json data = devices;
+        wxGetApp().device_card_notify(data);
+
+        MessageDialog msg_window(nullptr, " " + _L("Connection has been disconnected and recovery attempt failed. Please reconnect.") + "\n", _L("Machine Disconnected"),
+                                 wxICON_QUESTION | wxOK);
+        msg_window.ShowModal();
+
+        wxGetApp().set_connect_host(nullptr);
+
+        wxGetApp().mainframe->plater()->sidebar().update_all_preset_comboboxes();
+    });
+}
+
+void sm_lan_on_connected(std::shared_ptr<Moonraker_Mqtt> host,
+                         const json&                     connect_params,
+                         const std::string&              ip,
+                         const std::string&              link_mode,
+                         const std::string&              id,
+                         const std::string&              userid,
+                         bool                            reload_device_view)
+{
+    // Mark other devices as disconnected
+    auto devices = wxGetApp().app_config->get_devices();
+    for (size_t i = 0; i < devices.size(); ++i) {
+        if (devices[i].connected) {
+            devices[i].connected = false;
+            wxGetApp().app_config->save_device_info(devices[i]);
+            break;
+        }
+    }
+
+    // Save a minimal DeviceInfo from the connection params.
+    // Full device details (machine_type, nozzle_sizes, device_name)
+    // are pushed later by Flutter via sw_UpdateDeviceInfo.
+    std::string dev_id = connect_params.count("sn") ? connect_params["sn"].get<std::string>() : ip;
+    {
+        DeviceInfo info;
+        bool exist = wxGetApp().app_config->get_device_info(dev_id, info);
+        if (!exist) {
+            info.dev_id    = dev_id;
+            info.connected = false;
+            info.protocol  = 0;
+            info.port      = 0;
+        }
+        info.ip        = ip;
+        info.connected = true;
+        info.link_mode = link_mode;
+        info.protocol  = int(PrintHostType::htMoonRaker_mqtt);
+        info.id        = id;
+        info.userid    = userid;
+        info.dev_name  = ip; // fallback device name
+        if (connect_params.count("sn") && connect_params["sn"].is_string()) {
+            info.sn       = connect_params["sn"].get<std::string>();
+            info.dev_name = info.sn != "" ? info.sn : ip;
+            info.dev_id   = info.sn != "" ? info.sn : info.dev_id;
+        }
+        // Carry over auth info from host
+        auto auth_info = host->get_auth_info();
+        info.ca       = "";
+        info.cert     = "";
+        info.key      = "";
+        info.user     = auth_info["user"];
+        info.password = auth_info["password"];
+        info.port     = auth_info["port"];
+        info.clientId = auth_info["clientId"];
+        wxGetApp().app_config->save_device_info(info);
+        // Remembered for the startup auto-connect (LanAutoConnect): the printer and the fingerprint
+        // of its CA, which a later auto-connect requires the printer to present again.
+        if (link_mode == "lan") {
+            AppConfig*        cfg         = wxGetApp().app_config;
+            const std::string fingerprint = lan_ca_fingerprint(auth_info.value("ca", std::string()));
+            if (cfg->get("last_connected_device") != info.dev_id || !fingerprint.empty())
+                cfg->set("last_connected_ca_sha256", fingerprint);
+            cfg->set("last_connected_device", info.dev_id);
+        }
+    }
+
+    devices = wxGetApp().app_config->get_devices();
+
+    json param;
+    param["command"]       = "local_devices_arrived";
+    param["sequece_id"]    = "10001";
+    param["data"]          = devices;
+    std::string logout_cmd = param.dump();
+    wxString    strJS      = wxString::Format("window.postMessage(%s)", logout_cmd);
+    GUI::wxGetApp().run_script(strJS);
+
+    // wcp sub
+    json data = devices;
+    wxGetApp().device_card_notify(data);
+
+    auto dialog = wxGetApp().get_web_device_dialog();
+    if (dialog) {
+        dialog->EndModal(1);
+    }
+
+    wxGetApp().app_config->set("use_new_connect", "true");
+    wxGetApp().mainframe->plater()->sidebar().update_all_preset_comboboxes(reload_device_view);
+    wxGetApp().mainframe->m_print_enable = true;
+    wxGetApp().mainframe->update_slice_print_status(MainFrame::eEventPlateUpdate);
+
+    if (!wxGetApp().mainframe->m_printer_view->isSnapmakerPage()) {
+        wxString url      = wxString::FromUTF8(LOCALHOST_URL + std::to_string(wxGetApp().get_page_http_port()) +
+                                               "/web/flutter_web/index.html?path=2");
+        auto     real_url = wxGetApp().get_international_url(url);
+        wxGetApp().mainframe->load_printer_url(real_url);
+    } else if (reload_device_view) {
+        wxString url      = wxString::FromUTF8(LOCALHOST_URL + std::to_string(wxGetApp().get_page_http_port()) +
+                                               "/web/flutter_web/index.html?path=2");
+        auto     real_url = wxGetApp().get_international_url(url);
+        wxGetApp().mainframe->load_printer_url(real_url);
+    }
+}
+
 void SSWCP_MqttAgent_Instance::sw_mqtt_set_engine()
 {
     try {
@@ -7411,59 +7574,7 @@ void SSWCP_MqttAgent_Instance::sw_mqtt_set_engine()
                             auto     self = weak_self.lock();
                             wxString msg  = "";
                             json     params;
-                            host->set_connection_lost([]() {
-                                wxGetApp().CallAfter([]() {
-                                    SSWCP_Instance::m_first_connected = true;
-                                    wxGetApp().app_config->clear_filament_extruder_map();
-                                    wxGetApp().preset_bundle->machine_filaments.clear();
-                                    wxGetApp().load_current_presets();
-                                });
-                                wxGetApp().CallAfter([]() {
-                                    wxGetApp().app_config->set("use_new_connect", "false");
-                                    auto p_config = &(wxGetApp().preset_bundle->printers.get_edited_preset().config);
-                                    p_config->set("print_host", "");
-
-                                    std::shared_ptr<PrintHost> ptr = nullptr;
-                                    wxGetApp().get_connect_host(ptr);
-                                    if (ptr) {
-                                        wxString disconn_msg = "";
-                                        json     disconn_param;
-                                        ptr->disconnect(disconn_msg, disconn_param);
-                                    }
-
-                                    wxGetApp().set_connect_host(nullptr);
-
-                                    auto devices = wxGetApp().app_config->get_devices();
-                                    for (size_t i = 0; i < devices.size(); ++i) {
-                                        if (devices[i].connected) {
-                                            devices[i].connected = false;
-                                            wxGetApp().app_config->save_device_info(devices[i]);
-                                            break;
-                                        }
-                                    }
-
-                                    // update card
-                                    json param;
-                                    param["command"]       = "local_devices_arrived";
-                                    param["sequece_id"]    = "10001";
-                                    param["data"]          = devices;
-                                    std::string logout_cmd = param.dump();
-                                    wxString    strJS      = wxString::Format("window.postMessage(%s)", logout_cmd);
-                                    GUI::wxGetApp().run_script(strJS);
-
-                                    // wcp sub
-                                    json data = devices;
-                                    wxGetApp().device_card_notify(data);
-
-                                    MessageDialog msg_window(nullptr, " " + _L("Connection has been disconnected and recovery attempt failed. Please reconnect.") + "\n", _L("Machine Disconnected"),
-                                                             wxICON_QUESTION | wxOK);
-                                    msg_window.ShowModal();
-
-                                    wxGetApp().set_connect_host(nullptr);
-
-                                    wxGetApp().mainframe->plater()->sidebar().update_all_preset_comboboxes();
-                                });
-                            });
+                            host->set_connection_lost(sm_lan_on_connection_lost);
                             bool res = true;
 
                             std::string ip_port = host->get_host();
@@ -7477,95 +7588,7 @@ void SSWCP_MqttAgent_Instance::sw_mqtt_set_engine()
                             // with sw_UpdateDeviceInfo and other MachineManage handlers that
                             // also read/write DeviceInfo on the UI thread via CallAfter.
                             wxGetApp().CallAfter([weak_self, reload_device_view, ip, host, connect_params, link_mode, id, userid]() {
-                                // Mark other devices as disconnected
-                                auto devices = wxGetApp().app_config->get_devices();
-                                for (size_t i = 0; i < devices.size(); ++i) {
-                                    if (devices[i].connected) {
-                                        devices[i].connected = false;
-                                        wxGetApp().app_config->save_device_info(devices[i]);
-                                        break;
-                                    }
-                                }
-
-                                // Save a minimal DeviceInfo from the connection params.
-                                // Full device details (machine_type, nozzle_sizes, device_name)
-                                // are pushed later by Flutter via sw_UpdateDeviceInfo.
-                                std::string dev_id = connect_params.count("sn") ? connect_params["sn"].get<std::string>() : ip;
-                                {
-                                    DeviceInfo info;
-                                    bool exist = wxGetApp().app_config->get_device_info(dev_id, info);
-                                    if (!exist) {
-                                        info.dev_id    = dev_id;
-                                        info.connected = false;
-                                        info.protocol  = 0;
-                                        info.port      = 0;
-                                    }
-                                    info.ip        = ip;
-                                    info.connected = true;
-                                    info.link_mode = link_mode;
-                                    info.protocol  = int(PrintHostType::htMoonRaker_mqtt);
-                                    info.id        = id;
-                                    info.userid    = userid;
-                                    info.dev_name  = ip; // fallback device name
-                                    if (connect_params.count("sn") && connect_params["sn"].is_string()) {
-                                        info.sn       = connect_params["sn"].get<std::string>();
-                                        info.dev_name = info.sn != "" ? info.sn : ip;
-                                        info.dev_id   = info.sn != "" ? info.sn : info.dev_id;
-                                    }
-                                    // Carry over auth info from host
-                                    auto auth_info = host->get_auth_info();
-                                    info.ca       = "";
-                                    info.cert     = "";
-                                    info.key      = "";
-                                    info.user     = auth_info["user"];
-                                    info.password = auth_info["password"];
-                                    info.port     = auth_info["port"];
-                                    info.clientId = auth_info["clientId"];
-                                    wxGetApp().app_config->save_device_info(info);
-                                }
-
-                                devices = wxGetApp().app_config->get_devices();
-
-                                    json param;
-                                    param["command"]       = "local_devices_arrived";
-                                    param["sequece_id"]    = "10001";
-                                    param["data"]          = devices;
-                                    std::string logout_cmd = param.dump();
-                                    wxString    strJS      = wxString::Format("window.postMessage(%s)", logout_cmd);
-                                    GUI::wxGetApp().run_script(strJS);
-
-                                    // wcp sub
-                                    json data = devices;
-                                    wxGetApp().device_card_notify(data);
-
-                                    /*MessageDialog msg_window(nullptr, ip + " " + _L("connected sucessfully !") + "\n", _L("Machine
-                                    Connected"), wxICON_QUESTION | wxOK); msg_window.ShowModal();*/
-
-                                    auto dialog = wxGetApp().get_web_device_dialog();
-                                    if (dialog) {
-                                        dialog->EndModal(1);
-                                    }
-
-                                    wxGetApp().app_config->set("use_new_connect", "true");
-                                    wxGetApp().mainframe->plater()->sidebar().update_all_preset_comboboxes(reload_device_view);
-                                    wxGetApp().mainframe->m_print_enable = true;
-                                    wxGetApp().mainframe->update_slice_print_status(MainFrame::eEventPlateUpdate);
-
-                                    if (!wxGetApp().mainframe->m_printer_view->isSnapmakerPage()) {
-                                        wxString url      = wxString::FromUTF8(LOCALHOST_URL + std::to_string(wxGetApp().get_page_http_port()) +
-                                                                               "/web/flutter_web/index.html?path=2");
-                                        auto     real_url = wxGetApp().get_international_url(url);
-                                        wxGetApp().mainframe->load_printer_url(real_url);
-                                    } else {
-                                        if (reload_device_view) {
-                                            wxString url      = wxString::FromUTF8(LOCALHOST_URL + std::to_string(wxGetApp().get_page_http_port()) +
-                                                                                   "/web/flutter_web/index.html?path=2");
-                                            auto     real_url = wxGetApp().get_international_url(url);
-
-                                            wxGetApp().mainframe->load_printer_url(real_url);
-                                        }
-
-                                    }
+                                sm_lan_on_connected(host, connect_params, ip, link_mode, id, userid, reload_device_view);
 
                                     auto self = weak_self.lock();
                                     if (!self) {

@@ -129,6 +129,8 @@
 #include "WebDownPluginDlg.hpp"
 #include "WebGuideDialog.hpp"
 #include "ReleaseNote.hpp"
+#include "AppImageUpdater.hpp"
+#include "LanAutoConnect.hpp"
 #include "PrivacyUpdateDialog.hpp"
 #include "ModelMall.hpp"
 #include "HintNotification.hpp"
@@ -1229,6 +1231,9 @@ void GUI_App::post_init()
            }
         }
     }
+    if (is_editor())
+        start_lan_auto_connect();
+
     BOOST_LOG_TRIVIAL(info) << "finished post_init";
 //BBS: remove the single instance currently
 #ifdef _WIN32
@@ -2833,10 +2838,26 @@ bool GUI_App::on_init_inner()
             });
 
         Bind(EVT_ENTER_FORCE_UPGRADE, [this](const wxCommandEvent& evt) {
+                // A webview's AddScriptMessageHandler waits in a nested event loop (RunScriptSync).
+                // Showing the modal here would run the whole flow, including closing the main frame,
+                // inside that wait, which then touches its destroyed view: retry once it returned.
+                // A timer, not CallAfter: re-posting from pending-event processing would spin there
+                // without ever returning to the loop that lets the script finish.
+                if (is_adding_script_handler()) {
+                    static wxTimer* retry = nullptr; // never freed: only ever started from here
+                    if (retry == nullptr) {
+                        retry = new wxTimer(this);
+                        Bind(wxEVT_TIMER, [this](wxTimerEvent&) { QueueEvent(new wxCommandEvent(EVT_ENTER_FORCE_UPGRADE)); }, retry->GetId());
+                    }
+                    retry->StartOnce(200);
+                    return;
+                }
                 wxString      version_str = wxString::FromUTF8(this->app_config->get("upgrade", "version"));
                 wxString      description_text = wxString::FromUTF8(this->app_config->get("upgrade", "description"));
                 std::string   download_url = this->app_config->get("upgrade", "url");
-                wxString tips = wxString::Format(_L("Click to download new version in default browser: %s"), version_str);
+                wxString tips = wxString::Format(appimage_can_self_update() ? _L("Click Download to install the new version: %s") :
+                                                                              _L("Click to download new version in default browser: %s"),
+                                                 version_str);
                 DownloadDialog dialog(this->mainframe,
                     tips,
                     _L("The Snapmaker Orca needs an upgrade"),
@@ -2848,7 +2869,9 @@ bool GUI_App::on_init_inner()
                 switch (result)
                 {
                  case wxID_YES:
-                     wxLaunchDefaultBrowser(download_url);
+                     // The app closes either way: a failed in-place update must not leave the user without the new version.
+                     if (wxGetApp().download_update(download_url) == AppImageUpdateResult::Failed)
+                         wxLaunchDefaultBrowser(download_url);
                      wxGetApp().mainframe->Close(true);
                      break;
                  case wxID_NO:
@@ -2974,8 +2997,8 @@ bool GUI_App::on_init_inner()
         m_updateDialog = new UpdateVersionDialog(mainframe);
         m_updateDialog->Hide();
         m_updateDialog->Bind(EVT_DOWN_URL_PACK, [this](wxCommandEvent& event) {
-            auto downloadUlr = m_updateDialog->getUrl();
-            wxLaunchDefaultBrowser(downloadUlr);
+            if (download_update(m_updateDialog->getUrl()) == AppImageUpdateResult::RestartRequested)
+                mainframe->Close();
         });
     }
     profiler.mark("mainframe construction");
@@ -3938,8 +3961,8 @@ void GUI_App::recreate_GUI(const wxString &msg_name)
         m_updateDialog = new UpdateVersionDialog(mainframe);
         m_updateDialog->Hide();
         m_updateDialog->Bind(EVT_DOWN_URL_PACK, [this](wxCommandEvent& event) {
-            auto downloadUlr = m_updateDialog->getUrl();
-            wxLaunchDefaultBrowser(downloadUlr);
+            if (download_update(m_updateDialog->getUrl()) == AppImageUpdateResult::RestartRequested)
+                mainframe->Close();
         });
     }
     if (is_editor())
@@ -5279,9 +5302,26 @@ void GUI_App::check_preset_version()
     if (preset_updater != nullptr)
         preset_updater->sync_config_async();
 }
+AppImageUpdateResult GUI_App::download_update(const std::string& url)
+{
+    if (m_updateDialog)
+        m_updateDialog->Hide();
+    // Linux AppImage: replace in place; elsewhere (or not replaceable): open the download in the browser.
+    const AppImageUpdateResult result =
+        appimage_self_update(mainframe, url, version_info.sha256, version_info.size, version_info.version_str);
+    if (result == AppImageUpdateResult::NotApplicable)
+        wxLaunchDefaultBrowser(url);
+    return result;
+}
+
 void GUI_App::check_new_version_sf(bool show_tips, bool by_user)
 {
     std::string update_url = app_config->get_version_upgrade_url();
+#ifdef __linux__
+    // Snapmaker's update server has no Linux builds; Linux builds follow the fork's GitHub releases.
+    if (app_config->get("orca_upgrade_url").empty())
+        update_url = ORCA_LINUX_UPDATE_URL;
+#endif
 
     AppConfig* app_config = wxGetApp().app_config;
 
@@ -5317,6 +5357,7 @@ void GUI_App::check_new_version_sf(bool show_tips, bool by_user)
             version_info.force_upgrade  = isForceUpgrade;
 
             version_info.version_str = dataObj.value("version", "");
+            const int fork_build     = dataObj.value("fork_build", 0);
             auto releaseType         = dataObj.value("release_type", "");
 
             if (releaseType != RELEASE_TYPE_STABLE)
@@ -5379,21 +5420,38 @@ void GUI_App::check_new_version_sf(bool show_tips, bool by_user)
                 reservedData2 = platformObj.value("reserved_2", "");
 
             }
+            else if (platformType == "linux")
+            {
+                fileSize         = defaultObj.value("file_size", 0);
+                fileSha256       = defaultObj.value("file_sha256", "");
+                version_info.url = defaultObj.value("file_url", "");
+            }
             else
             {
-                BOOST_LOG_TRIVIAL(warning) << "don't support linux upgrade";
+                BOOST_LOG_TRIVIAL(warning) << "unsupported update platform_type: " << platformType;
                 return;
             }
+            version_info.sha256 = fileSha256;
+            version_info.size   = fileSize > 0 ? size_t(fileSize) : 0;
 
             std::regex matcher("[0-9]+\\.[0-9]+(\\.[0-9]+)*(-[A-Za-z0-9]+)?(\\+[A-Za-z0-9]+)?");
             Semver     current_version = get_version(Snapmaker_VERSION, matcher);
 
             Semver server_version = get_version(version_info.version_str, matcher);
 
-            if (current_version >= server_version) {
+            // Fork releases of the same Snapmaker version are ordered by fork_build.
+            const bool newer = server_version > current_version ||
+                               (server_version == current_version && fork_build > ORCA_FORK_BUILD);
+            if (!newer) {
                 if(by_user)
                     this->no_new_version();
                 return;
+            }
+            if (fork_build > 0) {
+                // Keep version_str string-comparable for the "skip this version" check.
+                char build_suffix[16];
+                std::snprintf(build_suffix, sizeof(build_suffix), "+b%04d", fork_build);
+                version_info.version_str += build_suffix;
             }
 
             if (isForceUpgrade)

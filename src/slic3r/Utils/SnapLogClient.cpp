@@ -841,7 +841,7 @@ void SnapLogClient::rt_worker_loop(std::shared_ptr<Internals> in)
             return;
         if (in->deps_invalid.load(std::memory_order_relaxed))
             return;
-        if (!in->consent.load(std::memory_order_relaxed)) {
+        if (!in->consent.load(std::memory_order_relaxed) || in->rt_paused_for_test.load(std::memory_order_relaxed)) {
             // Consent false: sleep and re-check. We do NOT exit the thread on
             // consent-false (consent may flip back on); we just stop sending.
             std::this_thread::sleep_for(std::chrono::milliseconds(in->cfg.poll_interval_ms > 0 ? in->cfg.poll_interval_ms : 1));
@@ -1693,6 +1693,12 @@ void SnapLogClient::set_auth_known_dead_for_test(bool v)
     in->auth_known_dead.store(v, std::memory_order_relaxed);
     if (!v)
         in->auth_dead_skip_counted.store(false, std::memory_order_relaxed);
+}
+
+void SnapLogClient::pause_realtime_worker_for_test(bool paused)
+{
+    if (auto in = internals())
+        in->rt_paused_for_test.store(paused, std::memory_order_relaxed);
 }
 
 std::string sanitize_file_name(std::string s)

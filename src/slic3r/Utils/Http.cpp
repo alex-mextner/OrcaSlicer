@@ -256,6 +256,14 @@ size_t Http::priv::writecb(void *data, size_t size, size_t nmemb, void *userp)
 		return 0;
 	}
 
+	if (self->buffer.empty()) {
+		// Large bodies (AppImage updates): allocate once instead of doubling through reallocations.
+		curl_off_t content_length = -1;
+		if (::curl_easy_getinfo(self->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length) == CURLE_OK &&
+			content_length > 0 && size_t(content_length) <= limit)
+			self->buffer.reserve(size_t(content_length));
+	}
+
 	self->buffer.append(cdata, realsize);
 
 	return realsize;

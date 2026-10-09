@@ -1141,6 +1141,19 @@ void MainFrame::shutdown(bool isRecreate)
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "MainFrame::shutdown enter";
     m_shutting_down = true;
+#ifdef __WXGTK__
+    // The edge panels are child windows destroyed by wxWidgets; size events during teardown must
+    // not reach them through update_edge_panels().
+    m_edge_bottom = nullptr;
+    m_edge_left   = nullptr;
+    m_edge_right  = nullptr;
+#endif
+    // Destroy the slice-mode popup while the frame is still whole: left to DestroyChildren() in
+    // ~wxWindow it unbinds from this half-destroyed frame and crashes on exit (SIGSEGV in DoUnbind).
+    if (m_slice_mode_popup) {
+        m_slice_mode_popup->Destroy();
+        m_slice_mode_popup = nullptr;
+    }
     // BBS: backup
     Slic3r::set_backup_callback(nullptr);
 #ifdef _WIN32

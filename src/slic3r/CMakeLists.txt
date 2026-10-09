@@ -24,6 +24,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/AMSSetting.hpp
     GUI/AmsWidgets.cpp
     GUI/AmsWidgets.hpp
+    GUI/AppImageUpdater.cpp
+    GUI/AppImageUpdater.hpp
     GUI/Auxiliary.cpp
     GUI/AuxiliaryDataViewModel.cpp
     GUI/AuxiliaryDataViewModel.hpp
@@ -292,6 +294,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Jobs/Worker.hpp
     GUI/KBShortcutsDialog.cpp
     GUI/KBShortcutsDialog.hpp
+    GUI/LanAutoConnect.cpp
+    GUI/LanAutoConnect.hpp
     GUI/MainFrame.cpp
     GUI/MainFrame.hpp
     GUI/MarkdownTip.cpp

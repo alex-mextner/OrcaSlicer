@@ -542,6 +542,9 @@ struct FakeClient
         SnapLogDeps   d = deps; // copy (lambdas capture by value via this*)
         SnapLogConfig c = cfg;
         SnapLogClient::instance().init(std::move(d), std::move(c));
+        // These tests check what log() admits into the realtime queue; a worker draining it
+        // concurrently would make the queue size depend on scheduling.
+        SnapLogClient::instance().pause_realtime_worker_for_test(true);
         // Default to logged-in so existing tests pass the login gate (log()
         // drops events when user_token is empty). Tests that exercise the
         // gate itself call set_user_token("") explicitly.

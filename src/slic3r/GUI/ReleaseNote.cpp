@@ -1,4 +1,5 @@
 #include "ReleaseNote.hpp"
+#include "AppImageUpdater.hpp"
 #include "I18N.hpp"
 
 #include "libslic3r/Utils.hpp"
@@ -538,7 +539,11 @@ void UpdateVersionDialog::update_version_info(wxString release_note, wxString ve
     else {
         m_simplebook_release_note->SetMaxSize(wxSize(FromDIP(560), FromDIP(430)));
         m_simplebook_release_note->SetSelection(0);
-        m_text_up_info->SetLabel(wxString::Format(_L("Click to download new version in default browser: %s"), version));
+        // A Linux AppImage installs the update in place (AppImageUpdater) instead of opening the browser.
+        const bool in_place = appimage_can_self_update();
+        m_text_up_info->SetLabel(wxString::Format(in_place ? _L("Click Download to install the new version: %s") :
+                                                             _L("Click to download new version in default browser: %s"),
+                                                  version));
         wxBoxSizer* sizer_text_release_note = new wxBoxSizer(wxVERTICAL);
         auto        m_staticText_release_note = new ::Label(m_scrollwindows_release_note, release_note, LB_AUTO_WRAP);
         m_staticText_release_note->SetMinSize(wxSize(FromDIP(560), -1));

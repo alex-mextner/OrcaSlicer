@@ -3,6 +3,7 @@
 
 #include <wx/popupwin.h>
 #include <wx/timer.h>
+#include <wx/weakref.h>
 
 #include <vector>
 
@@ -44,6 +45,9 @@ private:
     // The popup is an override-redirect window that stays on top of everything,
     // so hide it when the application loses activation (mirrors Widgets/PopupWindow).
     void on_top_window_activate(wxActivateEvent &evt);
+    // Bound in the constructor. Weak: when the main frame is destroyed, the popup's original parent
+    // chain is already gone, so it must not be walked again from the destructor.
+    wxWeakRef<wxWindow> m_top_level;
 #endif
 
     std::vector<wxWindow*> m_anchors;

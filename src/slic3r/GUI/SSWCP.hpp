@@ -43,6 +43,8 @@ using tcp = asio::ip::tcp;
 #define GET_FILES_FROM_DIR "sw_GetFilesFromDir"
 #define NOTIFY_UPLOAD_TIMELASPE "sw_NotifyUploadTimelaspe"
 
+namespace Slic3r { class Moonraker_Mqtt; }
+
 namespace Slic3r { namespace GUI {
 
 class WCP_Logger
@@ -776,6 +778,20 @@ private:
 
 std::string base64_encode(const char* data, size_t len);
 std::string make_wcp_download_url(const std::string& file_path);
+
+// LAN (MQTT) printer connection lifecycle, shared by the Flutter connect flow (sw_mqtt_set_engine)
+// and the startup auto-connect (LanAutoConnect).
+// Connection-lost callback for a Moonraker_Mqtt host; safe to call from any thread.
+void sm_lan_on_connection_lost();
+// UI thread only: records the device as connected and refreshes the device cards, sidebar and
+// printer page. Never switches the main window tab.
+void sm_lan_on_connected(std::shared_ptr<Moonraker_Mqtt> host,
+                         const nlohmann::json&           connect_params,
+                         const std::string&              ip,
+                         const std::string&              link_mode,
+                         const std::string&              id,
+                         const std::string&              userid,
+                         bool                            reload_device_view);
 
 }};
 

@@ -222,6 +222,8 @@ scripts/ubuntu2604/build.sh -isr     # rebuild slicer + AppImage
 Outputs: `build/package/snapmaker-orca` (run in place) and `build/Snapmaker_Orca_Linux_V*.AppImage`.
 Host runtime needs: `libgtk-3-0t64`, `libwebkit2gtk-4.1-0`, `libopengl0` (present on a stock desktop install).
 
+`scripts/ubuntu2604/remote-build.sh` runs the same build (plus the AppImage and the test suite) on a temporary [Runpod](https://www.runpod.io) CPU pod: 32 vCPU `cpu5c` by default, about $1.1/h, roughly 12 minutes (≈ $0.25) for a full build including dependencies. The pod is deleted when the script exits. As backstops, a detached local process deletes it after 3 hours, and so does the pod itself when Runpod gives it its own credentials (the script reports whether it did). A pod orphaned by this machine going down is otherwise only stopped by hand in the Runpod console. Only the AppImage comes back to `build/`. It needs a Runpod API key (`runpodctl doctor`, or `RUNPOD_API_KEY`), `gh` with push access to the fork, and `~/.ssh/id_ed25519`. HEAD is pushed to a temporary `remote-build/<sha>` branch and uncommitted changes are copied over rsync. Built dependencies are cached as a `deps-<hash>` prerelease of the fork. Both builds provision their environment from `scripts/ubuntu2604/provision.sh`.
+
 #### Command-line slicing
 
 `--load-settings`/`--load-filaments` read a preset file as-is and do not follow `inherits`, so system presets must be flattened first (otherwise inherited values such as `filament_density` are missing):
@@ -237,6 +239,18 @@ build/package/snapmaker-orca --slice 0 --outputdir out --export-3mf out.3mf \
 ```
 
 The CLI skips plate thumbnails on Linux: it renders them through an OSMesa context, and the bundled GLEW cannot initialize on one (even with `libosmesa6` installed). G-code and 3MF are otherwise complete. If the printer screen needs a preview image, slice in the GUI, which renders thumbnails with the regular OpenGL context.
+
+#### Releases and in-app updates
+
+Linux builds check `ORCA_LINUX_UPDATE_URL` (`version.inc`; default: the fork's `releases/latest/download/version.json`) on startup and from Help → Check for Update. A release is offered when its Snapmaker version is newer, or equal with a higher `fork_build`. When the app runs from a writable AppImage, Download fetches the new AppImage, verifies its SHA-256, replaces the file in place and offers a restart. Otherwise it opens the download in the browser. Setting `orca_upgrade_url` in `Snapmaker_Orca.conf` overrides the manifest URL.
+
+`scripts/fork-sync/release.sh [--merge <upstream-tag>] [--dry-run]` builds deps, the slicer, the AppImage and the tests, runs the test suite and a CLI smoke slice. The build runs on Runpod through `remote-build.sh` when an API key is configured (`BUILD_BACKEND=local` forces the local container). It then bumps `ORCA_FORK_BUILD`, tags `v<version>-linux.<build>` and publishes the AppImage and `version.json` as the latest GitHub release.
+
+`scripts/fork-sync/install.sh` installs a systemd user timer (every 3 hours) that runs `check-upstream.sh`. When Snapmaker publishes a new stable release, the timer starts a headless `omp` session (`scripts/fork-sync/omp-prompt.md`). That session merges the tag, fixes conflicts and build/test failures, and publishes through `release.sh`. Logs go to `~/.local/state/snap-orca-sync/logs`, and a desktop notification reports the result. A failed tag is not retried until `check-upstream.sh --force <tag>`. No human reviews the merge before clients are offered it: the only gates are the build, the test suite and the smoke slice. Read the log after each notification; `gh release delete <tag>` withdraws a bad release (the manifest URL then resolves to the previous release, but clients that already updated keep the bad build until the next release).
+
+#### LAN printer auto-connect
+
+After a printer has been connected once from the Device page, later starts reconnect to it in the background without switching to the Device tab. The printer re-issues TLS credentials for the stored client id (`server.client_manager.confirm_lan_status`), so no confirmation is needed on its screen. That reply arrives over plain MQTT, so it is accepted only for the stored serial number and client id, and only with the CA certificate seen on the previous connection (`last_connected_ca_sha256`, trust on first use). If the printer no longer authorizes the client or presents another CA, the app stays disconnected; add the printer again on the Device page. Opt out with Preferences → Presets → "Reconnect to the last LAN printer on startup" (`auto_connect_last_printer`).
 
 ### Linux Build
 

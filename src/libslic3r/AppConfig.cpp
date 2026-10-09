@@ -314,6 +314,10 @@ void AppConfig::set_defaults()
         set_bool("remember_printer_config", true);
     }
 
+    if (get("auto_connect_last_printer").empty()) {
+        set_bool("auto_connect_last_printer", true);
+    }
+
     if (get("auto_calculate_when_filament_change").empty()){
         set_bool("auto_calculate_when_filament_change", true);
     }
