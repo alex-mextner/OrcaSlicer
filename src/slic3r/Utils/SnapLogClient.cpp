@@ -1315,6 +1315,10 @@ void SnapLogClient::shutdown()
     if (!in)
         return;
     const bool deferred_consent_purge = purge_completion_active(m_purge_completion) && m_purge_spool_dir == in->spool_dir_resolved;
+    // Publish the final-flush request before stop_receiving: bt_worker reads
+    // stop_receiving without drain_and_flush as "exit once bt_queue is empty",
+    // and the realtime join below can hold this thread for seconds.
+    in->drain_and_flush.store(true);
     in->stop_receiving.store(true);
     cancel_current(in, SnapLogPolicy::Realtime); // abort in-flight so worker's done() trips
 
@@ -1362,17 +1366,9 @@ void SnapLogClient::shutdown()
         }
     }
 
-    bool batch_request_active = in->batch_requests_in_progress.load(std::memory_order_acquire) > 0;
-    // Cancelling an in-progress upload must not cause the flusher to issue a
-    // fresh create request before the synchronous do_request call unwinds.
-    if (batch_request_active)
-        in->stop_uploads.store(true, std::memory_order_release);
-    cancel_current(in, SnapLogPolicy::Buffered);
-
     if (in->bt_worker.joinable()) {
-        // Set drain_and_flush so bt_worker drains the remaining bt_queue to
-        // active.log, rotates to sealed, uploads, then exits.
-        in->drain_and_flush.store(true);
+        // drain_and_flush (published above) makes bt_worker drain the remaining
+        // bt_queue to active.log, rotate to sealed, upload, then exit.
         cancel_current(in, SnapLogPolicy::Buffered); // abort any in-flight PUT
 
         // Bounded join on bt_worker: same promise/future + detach + pin pattern
@@ -2084,7 +2080,7 @@ static void attempt_upload(std::shared_ptr<SnapLogClient::Internals> in, uint64_
     if (!batch_worker_current(in, generation))
         return;
 
-    // A shutdown/consent transition that cancelled an in-flight request leaves
+    // A consent-OFF/re-init transition that cancelled an in-flight request leaves
     // its sealed file on disk and must not start another upload.
     if (in->stop_uploads.load(std::memory_order_acquire)) {
         if (in->bt_upload_phase != Phase::Idle) {
@@ -2128,10 +2124,7 @@ static void attempt_upload(std::shared_ptr<SnapLogClient::Internals> in, uint64_
             !in->deps.do_request)
             return false;
 
-        std::shared_ptr<SnapLogHandle> h;
-        in->batch_requests_in_progress.fetch_add(1, std::memory_order_acq_rel);
-        h = in->deps.do_request(method, url, std::move(headers), body_file, body_str);
-        in->batch_requests_in_progress.fetch_sub(1, std::memory_order_acq_rel);
+        std::shared_ptr<SnapLogHandle> h = in->deps.do_request(method, url, std::move(headers), body_file, body_str);
         if (!h)
             return false;
 
@@ -2381,9 +2374,7 @@ static void handle_bt_retry_or_fail(std::shared_ptr<SnapLogClient::Internals> in
     if (in->deps.do_request) {
         BatchRequest creq = build_batch_cancel_request(in->deps, in->cfg, in->bt_frozen_client_id, in->bt_frozen_token,
                                                        in->nonce_gen_for_test, /*uploadId*/ "");
-        in->batch_requests_in_progress.fetch_add(1, std::memory_order_acq_rel);
         (void) in->deps.do_request("POST", creq.url, creq.headers, nullptr, &creq.body);
-        in->batch_requests_in_progress.fetch_sub(1, std::memory_order_acq_rel);
     }
 
     if (!batch_worker_current(in, generation))
@@ -2406,10 +2397,7 @@ static void handle_bt_retry_or_fail(std::shared_ptr<SnapLogClient::Internals> in
         bool issued = false;
         if (batch_worker_current(in, generation) && !in->stop_uploads.load(std::memory_order_acquire) && !batch_deps_unavailable(*in) &&
             in->consent.load(std::memory_order_relaxed) && in->deps.do_request) {
-            std::shared_ptr<SnapLogHandle> h;
-            in->batch_requests_in_progress.fetch_add(1, std::memory_order_acq_rel);
-            h = in->deps.do_request("POST", req.url, req.headers, nullptr, &req.body);
-            in->batch_requests_in_progress.fetch_sub(1, std::memory_order_acq_rel);
+            std::shared_ptr<SnapLogHandle> h = in->deps.do_request("POST", req.url, req.headers, nullptr, &req.body);
             if (h) {
                 std::lock_guard<std::mutex> hk(in->m_h_mu);
                 if (batch_worker_current(in, generation) && !in->stop_uploads.load(std::memory_order_acquire) &&
@@ -2507,7 +2495,7 @@ void SnapLogClient::bt_worker_loop(std::shared_ptr<Internals> in, uint64_t gener
                 return;
         }
         //    stop_receiving && !drain_and_flush && queue empty -> exit.
-        if (in->stop_receiving.load(std::memory_order_relaxed) && !in->drain_and_flush.load(std::memory_order_relaxed)) {
+        if (in->stop_receiving.load(std::memory_order_acquire) && !in->drain_and_flush.load(std::memory_order_relaxed)) {
             std::size_t qsize;
             {
                 std::lock_guard<std::mutex> qk(in->queue_mu);

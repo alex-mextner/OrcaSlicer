@@ -11,8 +11,9 @@
 #
 # Caches live on a Runpod network volume (RUNPOD_VOLUME, created on first use in RUNPOD_DC and
 # mounted at /workspace): the built dependencies per deps/ tree + provision.sh, the ccache of the
-# slicer and tests, and ninja's build log (so the longest units start first). A pod that cannot get
-# that data center falls back to building everything uncached elsewhere.
+# slicer and tests (ccache remote storage, written and read entry by entry), and ninja's build log
+# (so the longest units start first). A pod that cannot get that data center falls back to building
+# everything uncached elsewhere. Flavors are tried in RUNPOD_CPU_FLAVORS order.
 #
 # Needs: a Runpod API key (RUNPOD_API_KEY, or ~/.runpod/config.toml from `runpodctl doctor`), git
 # push access to FORK_REPO, and an SSH key (SSH_KEY, default ~/.ssh/id_ed25519).
@@ -130,7 +131,7 @@ fi
         touch /root/deps.restored
     fi
     rm -rf /root/deps.tmp
-    [[ -f /workspace/ccache.tar.zst ]] && zstd -dcq /workspace/ccache.tar.zst | tar -x -C /root/.cache || true
+    rm -f /workspace/ccache.tar.zst # archive of the previous cache layout
     [[ -f /workspace/ninja_log ]] && cp /workspace/ninja_log "$BUILD_ROOT/build/.ninja_log" || true
 ) &
 mkdir -p /root/.ssh /run/sshd
@@ -141,14 +142,14 @@ ssh-keygen -A
 exec /usr/sbin/sshd -D -e
 EOF
 )
-pod_request() { # pod_request VOLUME_ID: the create body, without a volume when VOLUME_ID is empty
-    python3 - "$FLAVORS" "$VCPU" "$((MAX_HOURS * 3600))" "$(cat "$SSH_KEY.pub")" "$boot" "$ROOT" "$deps_key" "$provision_url" \
+pod_request() { # pod_request VOLUME_ID FLAVOR: the create body, without a volume when VOLUME_ID is empty
+    python3 - "$2" "$VCPU" "$((MAX_HOURS * 3600))" "$(cat "$SSH_KEY.pub")" "$boot" "$ROOT" "$deps_key" "$provision_url" \
         "$1" "$VOLUME_DC" <<'EOF'
 import json, sys
-flavors, vcpu, max_seconds, pubkey, boot, root, deps_key, provision_url, volume, dc = sys.argv[1:]
+flavor, vcpu, max_seconds, pubkey, boot, root, deps_key, provision_url, volume, dc = sys.argv[1:]
 body = {
     "name": "snap-orca-build", "computeType": "CPU", "cloudType": "SECURE",
-    "cpuFlavorIds": flavors.split(","), "cpuFlavorPriority": "custom", "vcpuCount": int(vcpu),
+    "cpuFlavorIds": [flavor], "vcpuCount": int(vcpu),
     "imageName": "ubuntu:26.04", "containerDiskInGb": 100, "ports": ["22/tcp"],
     "env": {"BUILD_SSH_KEY": pubkey, "BUILD_MAX_SECONDS": max_seconds, "BUILD_ROOT": root,
             "BUILD_DEPS_KEY": deps_key, "BUILD_PROVISION_URL": provision_url},
@@ -159,12 +160,20 @@ if volume:
 print(json.dumps(body))
 EOF
 }
+# One flavor at a time, in order: with several, Runpod picks by availability (mostly the slower cpu3c).
+create_pod() { # create_pod VOLUME_ID: prints the pod JSON of the first flavor that has capacity
+    local flavor
+    for flavor in ${FLAVORS//,/ }; do
+        api -X POST "$API/pods" -d "$(pod_request "$1" "$flavor")" 2>/dev/null && return 0
+    done
+    return 1
+}
 step "creating pod ($VCPU vCPU, $FLAVORS${volume_id:+, cache volume in $VOLUME_DC})"
-if ! pod=$(api -X POST "$API/pods" -d "$(pod_request "$volume_id")"); then
+if ! pod=$(create_pod "$volume_id"); then
     [[ -n $volume_id ]] || die "pod creation failed"
     echo "remote-build.sh: warning: no capacity next to the cache volume in $VOLUME_DC, building uncached" >&2
     volume_id=""
-    pod=$(api -X POST "$API/pods" -d "$(pod_request "")") || die "pod creation failed"
+    pod=$(create_pod "") || die "pod creation failed"
 fi
 pod_id=$(field id <<<"$pod")
 step "pod $pod_id: $(field cpuFlavorId <<<"$pod") $(field vcpuCount <<<"$pod") vCPU $(field memoryInGb <<<"$pod") GB, \$$(field costPerHr <<<"$pod")/h"
@@ -242,9 +251,9 @@ fi
 wait_for /root/cache.done
 EOF
 
-on_pod_script "$ROOT" "$deps_key" "${volume_id:+1}" <<'EOF' || { rc=$?; [[ $rc == 12 ]] && die "tests failed on the pod" 12; die "build failed on the pod" 11; }
+on_pod_script "$ROOT" "$deps_key" "${volume_id:+1}" "${REMOTE_EXTRA_CMD:-}" <<'EOF' || { rc=$?; [[ $rc == 12 ]] && die "tests failed on the pod" 12; die "build failed on the pod" 11; }
 set -euo pipefail
-root=$1 deps_key=$2 volume=$3
+root=$1 deps_key=$2 volume=$3 extra_cmd=$4
 cd "$root"
 flags=-sitr
 [[ -f /root/deps.restored ]] || flags=-dsitr
@@ -261,28 +270,28 @@ jobs=$(( mem_kb / 1024 / 1024 / 2 ))
 (( jobs < 1 )) && jobs=1
 echo "cpus=$cpus mem=$(( mem_kb / 1024 / 1024 ))G jobs=$jobs flags=$flags"
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 CMAKE_BUILD_PARALLEL_LEVEL=$jobs
-# ccache for the slicer and tests. pch_defines,time_macros: required with precompiled headers;
-# include_file_*: the fresh checkout gives every header a new mtime.
-export CCACHE_DIR=/root/.cache/ccache CCACHE_BASEDIR=$root CCACHE_NOHASHDIR=1 CCACHE_COMPILERCHECK=content CCACHE_MAXSIZE=8G \
+# ccache for the slicer and tests, stored only on the volume (remote storage: hits are read and
+# new results written entry by entry, nothing to unpack or save). pch_defines,time_macros: required
+# with precompiled headers; include_file_*: the fresh checkout gives every header a new mtime.
+export CCACHE_DIR=/root/.cache/ccache CCACHE_BASEDIR=$root CCACHE_NOHASHDIR=1 CCACHE_COMPILERCHECK=content \
        CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime
+if [[ -n $volume ]]; then
+    mkdir -p /workspace/ccache
+    export CCACHE_REMOTE_STORAGE="file:///workspace/ccache|update-mtime=true" CCACHE_REMOTE_ONLY=true
+fi
 export ORCA_EXTRA_BUILD_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 ccache -z >/dev/null
 
-# Saved on failure too: a fix-and-retry build reuses everything that compiled. Nothing new
-# compiled (no misses): the stored archive is already current.
-save_caches() {
-    [[ -n $volume ]] || return 0
+# Also on failure: report the hit rate, expire entries unused for 30 days (update-mtime marks hits),
+# keep ninja's log.
+finish() {
     ccache -s | grep -m2 -E '^ *(Hits|Misses):' || true
-    if [[ $(ccache --print-stats | awk '$1 == "cache_miss" { print $2 }') != 0 ]]; then
-        ccache --evict-older-than 14d >/dev/null || true
-        tar -C /root/.cache -cf - ccache | zstd -T0 -3 -q -o /workspace/ccache.tar.zst.$$ &&
-            mv /workspace/ccache.tar.zst.$$ /workspace/ccache.tar.zst ||
-            echo "remote-build.sh: warning: could not save the ccache to the volume" >&2
-    fi
+    [[ -n $volume ]] || return 0
+    find /workspace/ccache -type f -mtime +30 -delete 2>/dev/null || true
     [[ ! -f $root/build/.ninja_log ]] || { cp "$root/build/.ninja_log" /workspace/ninja_log.$$ && mv /workspace/ninja_log.$$ /workspace/ninja_log; } ||
         echo "remote-build.sh: warning: could not save the ninja log to the volume" >&2
 }
-trap save_caches EXIT
+trap finish EXIT
 
 echo "== [$(date +%T)] build_linux.sh $flags"
 ./build_linux.sh "$flags" || exit 11
@@ -298,6 +307,11 @@ echo "== [$(date +%T)] tests: build"
 cmake --build build --config Release || exit 11
 echo "== [$(date +%T)] tests: run"
 cd build && ctest -C Release -j1 --output-on-failure || exit 12
+# REMOTE_EXTRA_CMD (e.g. repeat a flaky test): counted as a test failure when it fails.
+if [[ -n $extra_cmd ]]; then
+    echo "== [$(date +%T)] extra: $extra_cmd"
+    bash -c "$extra_cmd" || exit 12
+fi
 EOF
 
 step "fetching the AppImage"

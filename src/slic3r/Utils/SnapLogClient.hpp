@@ -542,9 +542,8 @@ public:
         std::deque<RtEvent>   bt_queue;
         std::atomic<bool>     auth_known_dead{false};        // set on 401/403 (B5)
         std::atomic<bool>     drain_and_flush{false};        // shutdown final-flush (B5/B6)
-        std::atomic<bool>     stop_uploads{false};           // shutdown/consent aborts uploads
+        std::atomic<bool>     stop_uploads{false};           // consent-OFF/re-init aborts uploads
         std::atomic<bool>     batch_deps_invalid{false};     // batch-only dependency fence
-        std::atomic<uint32_t> batch_requests_in_progress{0}; // synchronous do_request calls
         std::atomic<uint64_t> batch_queue_dropped{0};
         std::atomic<uint64_t> auth_dead_create_skipped{0}; // bumped in B5
         std::atomic<bool>     auth_dead_skip_counted{false};

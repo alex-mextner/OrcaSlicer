@@ -212,7 +212,16 @@ By uncommenting and using these options as needed, you can often resolve issues 
 
 ### Ubuntu 26.04 (containerized build, native run)
 
-Ubuntu 26.04 ships CMake 4.x, which `build_linux.sh` rejects. `scripts/ubuntu2604/build.sh` builds inside an `ubuntu:26.04` container (CMake 3.30, all `-dev` packages) under your UID, with the repo mounted at the same absolute path. No host `sudo` is needed. The resulting binary links against the same system libraries as the host and runs natively.
+Ubuntu 26.04 ships CMake 4.x, which `build_linux.sh` rejects. `scripts/ubuntu2604/build.sh` builds inside an `ubuntu:26.04` container (CMake 3.30, all `-dev` packages from `scripts/ubuntu2604/provision.sh`) under your UID, with the repo mounted at the same absolute path, at low CPU priority. No host `sudo` is needed. The resulting binary links against the same system libraries as the host and runs natively. Compiles go through ccache, kept in `~/.cache/snap-orca-ccache` (`SNAP_ORCA_CCACHE_DIR`), so a rebuild after a commit or a clean recompiles only what changed.
+
+| Command | What it does |
+|---|---|
+| `scripts/ubuntu2604/build.sh` | Local container build: deps + slicer (`./build_linux.sh -dsr`); pass other `build_linux.sh` flags, or `-- COMMAND` to run any command in the same environment |
+| `scripts/ubuntu2604/build.sh -isr` | Rebuild the slicer + AppImage locally |
+| `scripts/ubuntu2604/remote-build.sh` | Same build + AppImage + test suite on a Runpod pod; about 4 minutes with warm caches |
+| `scripts/ubuntu2604/gui-test/update-test.sh [normal\|force]` | Scripted in-app update test of an AppImage in a headless container |
+| `scripts/fork-sync/release.sh` | Build, test, smoke-slice and publish a fork release |
+| `scripts/fork-sync/install.sh` | Install the timer that merges and releases new Snapmaker versions |
 
 ```shell
 scripts/ubuntu2604/build.sh          # deps + slicer: ./build_linux.sh -dsr
@@ -223,6 +232,10 @@ Outputs: `build/package/snapmaker-orca` (run in place) and `build/Snapmaker_Orca
 Host runtime needs: `libgtk-3-0t64`, `libwebkit2gtk-4.1-0`, `libopengl0` (present on a stock desktop install).
 
 `scripts/ubuntu2604/remote-build.sh` runs the same build (plus the AppImage and the test suite) on a temporary [Runpod](https://www.runpod.io) CPU pod: 32 vCPU `cpu5c` by default, about $1.1/h. Only the AppImage comes back to `build/`. Caches live on a Runpod network volume (`snap-orca-cache`, 20 GB in `EU-RO-1`, about $1.4/month, created on first use): the built dependencies keyed by the `deps/` tree and `scripts/ubuntu2604/provision.sh`, a ccache of the slicer and tests, and ninja's build log, so the longest units start first. Without capacity in that data center the build runs uncached elsewhere (about 12–19 minutes including dependencies). The pod installs its packages (`provision.sh`, shared with the local container image) and unpacks the caches while the script connects. The pod is deleted when the script exits. As backstops, a detached local process deletes it after 3 hours, and so does the pod itself when Runpod gives it its own credentials (the script warns when it does not). A pod orphaned by this machine going down is otherwise only stopped by hand in the Runpod console. It needs a Runpod API key (`runpodctl doctor`, or `RUNPOD_API_KEY`), push access to the fork, and `~/.ssh/id_ed25519`. HEAD is pushed to a temporary `remote-build/<sha>` branch and uncommitted changes are copied over rsync. The commit hash reaches only `GUI_App.cpp` (through the generated `GitCommitHash.hpp`), so a new commit does not invalidate the cache.
+
+`REMOTE_EXTRA_CMD='…'` runs one more command in `build/` on the pod after the test suite, for example `REMOTE_EXTRA_CMD='ctest -C Release -R "batch lifecycle" --repeat until-fail:500'` to chase a flaky test without loading this machine.
+
+To test the in-app AppImage self-update end to end, run `scripts/ubuntu2604/gui-test/update-test.sh [normal|force] [AppImage]` (the AppImage defaults to the newest `build/Snapmaker_Orca_Linux_V*.AppImage`; it is copied, never modified). The script builds the `snap-orca-guitest:26.04` image on first use and runs the app in a container with no network, no devices and a private headless Xvfb display, so nothing touches host USB devices or appears on screen. Inside, a local HTTP server offers a newer fork build (a marked copy of the same AppImage). The script closes the setup wizard, clicks Download and answers the restart question: Yes for `normal`, No for the forced update in `force`. It then checks that the installed AppImage matches the manifest sha256, that the app exited with 0 and opened no browser, and for `normal` that the relaunched instance kept `--datadir` and exited cleanly. Each check prints PASS/FAIL and the script exits non-zero on any failure; screenshots and logs go to `${TMPDIR:-/tmp}/snap-orca-gui-test/<variant>-<timestamp>/`. `SO_RO=1` runs a read-only control in which Download must fall back to the browser.
 
 #### Command-line slicing
 

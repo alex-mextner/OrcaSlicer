@@ -26,11 +26,14 @@ Steps:
    upstream code that broke on Ubuntu 26.04 / GCC 15 is in scope. Never disable or delete tests to get
    green; never weaken the smoke test. Rerun `scripts/fork-sync/release.sh` until it publishes.
    A remote build failing for infrastructure reasons (pod creation, SSH, transfer; exit codes other
-   than 11/12) may be retried once; then rerun with `BUILD_BACKEND=local`.
+   than 11/12) may be retried twice; after that report failed.
 4. Never force-push, never rewrite published history, never touch other branches or the upstream remote.
 5. Never start Snapmaker Orca (binary or AppImage, GUI or CLI) directly on this host: its USB stack
    has hung the machine. Run it only inside the `snap-orca-build:26.04` container without device
    passthrough, as release.sh does. Never write to removable drives under /run/media.
+6. Never run heavy work on this laptop: no local builds (`BUILD_BACKEND=local`, `scripts/ubuntu2604/build.sh`,
+   `cmake --build`), no full test-suite runs, no stress loops. Builds and tests run on Runpod through
+   release.sh / scripts/ubuntu2604/remote-build.sh; reproduce a failing test by rerunning the remote build.
 
 When done, the last line of your answer must be exactly `RESULT: published <tag>` or
 `RESULT: failed <one-line reason>`. If you cannot finish, leave the working tree clean (commit

@@ -83,8 +83,7 @@ else
     echo "== build"
     scripts/ubuntu2604/build.sh -distr || die "build failed" 11
     # build_linux.sh builds only the Snapmaker_Orca target; -t merely configures the tests.
-    docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$ROOT:$ROOT" -w "$ROOT" "$BUILD_IMAGE" \
-        cmake --build build --config Release || die "test build failed" 11
+    scripts/ubuntu2604/build.sh -- cmake --build build --config Release || die "test build failed" 11
 
     echo "== tests"
     docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$ROOT:$ROOT" -w "$ROOT/build" "$BUILD_IMAGE" \
