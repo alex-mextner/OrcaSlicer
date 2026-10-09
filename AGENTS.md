@@ -10,6 +10,10 @@ Use out-of-source builds:
 - `cmake --build build --target tests` then `ctest --test-dir build --output-on-failure` runs automated suites.
 Platform helpers such as `build_linux.sh`, `build_release_macos.sh`, and `build_release_vs2022.bat` wrap the same flow with toolchain flags. Use `build_release_macos.sh -sx` when reproducing macOS build issues, and `scripts/DockerBuild.sh` for reproducible container builds.
 
+### Ubuntu 26.04 fork (branch `ubuntu-26.04`) — host rules
+- Never start Snapmaker Orca (AppImage or binary, GUI or CLI) directly on the development laptop: USB/HID enumeration there has hung the machine. Run it only in containers without device access (`scripts/ubuntu2604/gui-test/update-test.sh`, the smoke slice in `scripts/fork-sync/release.sh`).
+- No heavy work on the laptop: no local compiles, full test-suite runs or stress loops. Build and test on Runpod with `scripts/ubuntu2604/remote-build.sh` (`REMOTE_EXTRA_CMD` repeats a flaky test there); `release.sh` uses it by default. See `doc/developer-reference/How-to-build.md`, section "Ubuntu 26.04".
+
 ## Coding Style & Naming Conventions
 `.clang-format` enforces 4-space indents, a 140-column limit, aligned initializers, and brace wrapping for classes and functions. Run `clang-format -i <file>` before committing; the CMake `clang-format` target is available when LLVM tools are on your PATH. Prefer `CamelCase` for classes, `snake_case` for functions and locals, and `SCREAMING_CASE` for constants, matching conventions in `src/`. Keep headers self-contained and align include order with the IWYU pragmas.
 

@@ -164,8 +164,9 @@ EOF
 create_pod() { # create_pod VOLUME_ID: prints the pod JSON of the first flavor that has capacity
     local flavor
     for flavor in ${FLAVORS//,/ }; do
-        api -X POST "$API/pods" -d "$(pod_request "$1" "$flavor")" 2>/dev/null && return 0
+        api -X POST "$API/pods" -d "$(pod_request "$1" "$flavor")" 2>"$tmp/create.err" && return 0
     done
+    echo "remote-build.sh: last pod creation error: $(cat "$tmp/create.err")" >&2
     return 1
 }
 step "creating pod ($VCPU vCPU, $FLAVORS${volume_id:+, cache volume in $VOLUME_DC})"
@@ -251,20 +252,22 @@ fi
 wait_for /root/cache.done
 EOF
 
-on_pod_script "$ROOT" "$deps_key" "${volume_id:+1}" "${REMOTE_EXTRA_CMD:-}" <<'EOF' || { rc=$?; [[ $rc == 12 ]] && die "tests failed on the pod" 12; die "build failed on the pod" 11; }
+on_pod_script "$ROOT" "$deps_key" "${volume_id:+1}" "${REMOTE_EXTRA_CMD:-}" "$(field memoryInGb <<<"$pod")" <<'EOF' || { rc=$?; [[ $rc == 12 ]] && die "tests failed on the pod" 12; die "build failed on the pod" 11; }
 set -euo pipefail
-root=$1 deps_key=$2 volume=$3 extra_cmd=$4
+root=$1 deps_key=$2 volume=$3 extra_cmd=$4 pod_mem_gb=${5%%.*}
 cd "$root"
 flags=-sitr
 [[ -f /root/deps.restored ]] || flags=-dsitr
 # Parallel jobs: the vCPUs the pod may use (cgroup quota, nproc shows the host), capped at
-# 2 GB of RAM per job (the heaviest libslic3r units need about that much).
+# 2 GB of RAM per job (the heaviest libslic3r units need about that much). The RAM is the smallest
+# of the host, the cgroup limit and the pod size Runpod reports (the cgroup may say "max").
 cpus=$(nproc)
 read -r quota period </sys/fs/cgroup/cpu.max 2>/dev/null || quota=max
 [[ $quota != max ]] && cpus=$(( quota / period ))
 mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
-[[ $limit != max ]] && mem_kb=$(( limit / 1024 ))
+[[ $limit != max ]] && (( limit / 1024 < mem_kb )) && mem_kb=$(( limit / 1024 ))
+[[ $pod_mem_gb =~ ^[0-9]+$ ]] && (( pod_mem_gb > 0 && pod_mem_gb * 1024 * 1024 < mem_kb )) && mem_kb=$(( pod_mem_gb * 1024 * 1024 ))
 jobs=$(( mem_kb / 1024 / 1024 / 2 ))
 (( jobs > cpus )) && jobs=$cpus
 (( jobs < 1 )) && jobs=1
