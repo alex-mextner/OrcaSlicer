@@ -49,3 +49,5 @@ sentry-native/
 .claude/
 .hermes/
 CLAUDE.md
+# Release assets assembled by scripts/fork-sync/release.sh
+/dist/
