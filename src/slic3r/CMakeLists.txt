@@ -720,6 +720,16 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/GeneratedConfig.hpp.in
                ${CMAKE_CURRENT_BINARY_DIR}/GeneratedConfig.hpp
                @ONLY)
 
+# The commit hash goes into a header that only GUI_App.cpp includes, rewritten only when it
+# changes: as a compile definition it would alter every compile command (and the precompiled
+# headers) on each commit and defeat compiler caches across commits.
+if (NOT GIT_COMMIT_HASH)
+    set(GIT_COMMIT_HASH "0000000") # unknown
+endif ()
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/GitCommitHash.hpp.in
+               ${CMAKE_CURRENT_BINARY_DIR}/GitCommitHash.hpp
+               @ONLY)
+
 add_library(libslic3r_gui STATIC ${SLIC3R_GUI_SOURCES})
 target_include_directories(libslic3r_gui PRIVATE Utils ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(libslic3r_gui paho-mqttpp3-static)

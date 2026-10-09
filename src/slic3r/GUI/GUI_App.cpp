@@ -92,6 +92,7 @@
 #include "Plater.hpp"
 #include "GLCanvas3D.hpp"
 #include "GeneratedConfig.hpp"
+#include "GitCommitHash.hpp"
 
 #include "../Utils/PresetUpdater.hpp"
 #include "../Utils/PrintHost.hpp"
@@ -3154,7 +3155,7 @@ bool GUI_App::on_init_inner()
     };
 
     snap_cfg.app_version = SLIC3R_BUILD_ID;
-    snap_cfg.app_build   = GIT_COMMIT_HASH;
+    snap_cfg.app_build   = SLIC3R_GIT_COMMIT_HASH;
 #if defined(_WIN32)
     snap_cfg.platform = "Windows";
 #elif defined(__APPLE__)

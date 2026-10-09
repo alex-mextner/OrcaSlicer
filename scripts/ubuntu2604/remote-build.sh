@@ -8,11 +8,14 @@
 #
 # The pod checks out HEAD from the fork (pushed to a temporary remote-build/<sha> branch, deleted
 # afterwards) and receives uncommitted changes over rsync, so the build matches the working tree.
-# Built dependencies are cached as a prerelease deps-<hash> of the fork, keyed on the deps/ tree and
-# provision.sh; a cache miss builds them on the pod and uploads them from here.
 #
-# Needs: a Runpod API key (RUNPOD_API_KEY, or ~/.runpod/config.toml from `runpodctl doctor`), gh
-# logged in with push access to FORK_REPO, and an SSH key (SSH_KEY, default ~/.ssh/id_ed25519).
+# Caches live on a Runpod network volume (RUNPOD_VOLUME, created on first use in RUNPOD_DC and
+# mounted at /workspace): the built dependencies per deps/ tree + provision.sh, the ccache of the
+# slicer and tests, and ninja's build log (so the longest units start first). A pod that cannot get
+# that data center falls back to building everything uncached elsewhere.
+#
+# Needs: a Runpod API key (RUNPOD_API_KEY, or ~/.runpod/config.toml from `runpodctl doctor`), git
+# push access to FORK_REPO, and an SSH key (SSH_KEY, default ~/.ssh/id_ed25519).
 # Exit codes: 11 build failed, 12 tests failed, other non-zero: pod / transfer errors.
 set -euo pipefail
 
@@ -24,10 +27,14 @@ FORK_REPO=${FORK_REPO:-alex-mextner/SnapOrca}
 FLAVORS=${RUNPOD_CPU_FLAVORS:-cpu5c,cpu3c} # compute-optimized, 2 GB RAM per vCPU
 VCPU=${RUNPOD_VCPU:-32}                    # power of two, flavor maximum is 32
 MAX_HOURS=${RUNPOD_MAX_HOURS:-3}
+VOLUME=${RUNPOD_VOLUME:-snap-orca-cache}
+VOLUME_DC=${RUNPOD_DC:-EU-RO-1}            # has cpu5c and cpu3c
+VOLUME_GB=${RUNPOD_VOLUME_GB:-20}          # ~$0.07/GB/month
 SSH_KEY=${SSH_KEY:-$HOME/.ssh/id_ed25519}
 API=https://rest.runpod.io/v1
 
 die() { echo "remote-build.sh: $1" >&2; exit "${2:-1}"; }
+step() { printf '== [%dm%02ds] %s\n' $((SECONDS / 60)) $((SECONDS % 60)) "$*"; }
 
 api_key=${RUNPOD_API_KEY:-$(sed -nE 's/^apikey *= *"(.*)"/\1/p' "$HOME/.runpod/config.toml" 2>/dev/null || true)}
 [[ -n $api_key ]] || die "no Runpod API key: set RUNPOD_API_KEY or run runpodctl doctor"
@@ -58,7 +65,7 @@ cleanup() {
     if [[ -n $pod_id ]]; then
         local id=$pod_id
         pod_id=""
-        echo "== deleting pod $id"
+        step "deleting pod $id"
         api -X DELETE "$API/pods/$id" >/dev/null || echo "remote-build.sh: could not delete pod $id, delete it in the Runpod console" >&2
     fi
     [[ -z $watchdog_pid ]] || kill -- "-$watchdog_pid" 2>/dev/null || true # its session: bash + sleep
@@ -69,30 +76,63 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-# Dependencies cache key: everything that feeds deps/build/destdir.
-deps_tag=""
+# Dependencies cache key: everything that feeds deps/build/destdir (none for a modified tree).
+deps_key=""
 if [[ -z $(git status --porcelain -- deps scripts/ubuntu2604/provision.sh) ]]; then
-    deps_tag="deps-$(git rev-parse HEAD:deps | cut -c1-12)-$(git rev-parse HEAD:scripts/ubuntu2604/provision.sh | cut -c1-8)"
+    deps_key="$(git rev-parse HEAD:deps | cut -c1-12)-$(git rev-parse HEAD:scripts/ubuntu2604/provision.sh | cut -c1-8)"
 fi
-deps_url=""
-if [[ -n $deps_tag ]] && gh release view "$deps_tag" --repo "$FORK_REPO" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx destdir.tar.zst; then
-    deps_url="https://github.com/$FORK_REPO/releases/download/$deps_tag/destdir.tar.zst"
+# The pod provisions itself while this script waits for SSH, from the pushed commit's provision.sh;
+# a locally modified one is run over SSH after the sync instead.
+provision_url=""
+if git diff --quiet HEAD -- scripts/ubuntu2604/provision.sh; then
+    provision_url="https://raw.githubusercontent.com/$FORK_REPO/$sha/scripts/ubuntu2604/provision.sh"
 fi
-echo "== deps: ${deps_url:-build on the pod (no cache for ${deps_tag:-a modified deps/ tree})}"
 
-echo "== pushing $sha to $build_ref"
+step "pushing $sha to $build_ref"
 git push -q "$fork_url" "$sha:$build_ref" # named by the sha: an existing branch already matches
 
-# The pod runs plain ubuntu:26.04 with sshd started from the start command: enough to provision it
-# over SSH with the same provision.sh as the local container image.
+# A failed lookup builds uncached rather than creating a second volume.
+if volumes=$(api "$API/networkvolumes"); then
+    volume_id=$(python3 -c 'import json, sys
+for v in json.loads(sys.argv[3]):
+    if v.get("name") == sys.argv[1] and v.get("dataCenterId") == sys.argv[2]:
+        print(v["id"]); break' "$VOLUME" "$VOLUME_DC" "$volumes")
+    if [[ -z $volume_id ]]; then
+        step "creating cache volume $VOLUME ($VOLUME_GB GB in $VOLUME_DC)"
+        volume_id=$(api -X POST "$API/networkvolumes" -d "{\"name\":\"$VOLUME\",\"size\":$VOLUME_GB,\"dataCenterId\":\"$VOLUME_DC\"}" | field id || true)
+        [[ -n $volume_id ]] || echo "remote-build.sh: warning: could not create the cache volume, building uncached" >&2
+    fi
+else
+    volume_id=""
+    echo "remote-build.sh: warning: could not list network volumes, building uncached" >&2
+fi
+
+# Plain ubuntu:26.04: the start command installs and starts sshd, then in the background installs
+# the build environment (provision.sh) and unpacks the caches from /workspace.
 boot=$(cat <<'EOF'
-set -e
+set -eo pipefail # pipefail: a failed download must not pass as a successful provisioning
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends openssh-server ca-certificates curl git rsync zstd >/dev/null
 if [[ -n ${RUNPOD_API_KEY:-} && -n ${RUNPOD_POD_ID:-} ]]; then
     ( sleep "$BUILD_MAX_SECONDS"; curl -fsS -X DELETE -H "Authorization: Bearer $RUNPOD_API_KEY" "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" ) &
 fi
+if [[ -n $BUILD_PROVISION_URL ]]; then
+    ( set +e; curl -fsSL "$BUILD_PROVISION_URL" | bash >/root/provision.log 2>&1; echo $? >/root/provision.rc ) &
+fi
+(
+    trap 'touch /root/cache.done' EXIT # whatever fails here, the build step must not wait forever
+    mkdir -p "$BUILD_ROOT/deps/build" "$BUILD_ROOT/build" /root/.cache
+    # Into a scratch directory first: a truncated archive must not leave a partial destdir behind.
+    if [[ -n $BUILD_DEPS_KEY && -f /workspace/deps/$BUILD_DEPS_KEY.tar.zst ]] && mkdir -p /root/deps.tmp &&
+        zstd -dcq "/workspace/deps/$BUILD_DEPS_KEY.tar.zst" | tar -x -C /root/deps.tmp &&
+        mv /root/deps.tmp/destdir "$BUILD_ROOT/deps/build/destdir"; then
+        touch /root/deps.restored
+    fi
+    rm -rf /root/deps.tmp
+    [[ -f /workspace/ccache.tar.zst ]] && zstd -dcq /workspace/ccache.tar.zst | tar -x -C /root/.cache || true
+    [[ -f /workspace/ninja_log ]] && cp /workspace/ninja_log "$BUILD_ROOT/build/.ninja_log" || true
+) &
 mkdir -p /root/.ssh /run/sshd
 chmod 700 /root/.ssh
 printf '%s\n' "$BUILD_SSH_KEY" >/root/.ssh/authorized_keys
@@ -101,22 +141,33 @@ ssh-keygen -A
 exec /usr/sbin/sshd -D -e
 EOF
 )
-request=$(python3 - "$FLAVORS" "$VCPU" "$((MAX_HOURS * 3600))" "$(cat "$SSH_KEY.pub")" "$boot" <<'EOF'
+pod_request() { # pod_request VOLUME_ID: the create body, without a volume when VOLUME_ID is empty
+    python3 - "$FLAVORS" "$VCPU" "$((MAX_HOURS * 3600))" "$(cat "$SSH_KEY.pub")" "$boot" "$ROOT" "$deps_key" "$provision_url" \
+        "$1" "$VOLUME_DC" <<'EOF'
 import json, sys
-flavors, vcpu, max_seconds, pubkey, boot = sys.argv[1:]
-print(json.dumps({
+flavors, vcpu, max_seconds, pubkey, boot, root, deps_key, provision_url, volume, dc = sys.argv[1:]
+body = {
     "name": "snap-orca-build", "computeType": "CPU", "cloudType": "SECURE",
     "cpuFlavorIds": flavors.split(","), "cpuFlavorPriority": "custom", "vcpuCount": int(vcpu),
     "imageName": "ubuntu:26.04", "containerDiskInGb": 100, "ports": ["22/tcp"],
-    "env": {"BUILD_SSH_KEY": pubkey, "BUILD_MAX_SECONDS": max_seconds},
+    "env": {"BUILD_SSH_KEY": pubkey, "BUILD_MAX_SECONDS": max_seconds, "BUILD_ROOT": root,
+            "BUILD_DEPS_KEY": deps_key, "BUILD_PROVISION_URL": provision_url},
     "dockerStartCmd": ["bash", "-c", boot],
-}))
+}
+if volume:
+    body.update(networkVolumeId=volume, volumeMountPath="/workspace", dataCenterIds=[dc])
+print(json.dumps(body))
 EOF
-)
-echo "== creating pod ($VCPU vCPU, ${FLAVORS})"
-pod=$(api -X POST "$API/pods" -d "$request") || die "pod creation failed"
+}
+step "creating pod ($VCPU vCPU, $FLAVORS${volume_id:+, cache volume in $VOLUME_DC})"
+if ! pod=$(api -X POST "$API/pods" -d "$(pod_request "$volume_id")"); then
+    [[ -n $volume_id ]] || die "pod creation failed"
+    echo "remote-build.sh: warning: no capacity next to the cache volume in $VOLUME_DC, building uncached" >&2
+    volume_id=""
+    pod=$(api -X POST "$API/pods" -d "$(pod_request "")") || die "pod creation failed"
+fi
 pod_id=$(field id <<<"$pod")
-echo "== pod $pod_id: $(field cpuFlavorId <<<"$pod") $(field vcpuCount <<<"$pod") vCPU $(field memoryInGb <<<"$pod") GB, \$$(field costPerHr <<<"$pod")/h"
+step "pod $pod_id: $(field cpuFlavorId <<<"$pod") $(field vcpuCount <<<"$pod") vCPU $(field memoryInGb <<<"$pod") GB, \$$(field costPerHr <<<"$pod")/h"
 # Backstop if this script dies without its EXIT trap (kill -9, crash): a detached deleter, with the
 # key in its environment rather than argv. It does not survive this machine going down; the pod's
 # own deleter (when Runpod gives the pod its credentials, reported below) does.
@@ -145,14 +196,12 @@ for _ in $(seq 60); do
     sleep 5
 done
 on_pod true || die "pod $pod_id: SSH on $ip:$port does not answer"
-echo "== pod reachable at $ip:$port"
-if on_pod 'tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_API_KEY=." && tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_POD_ID=."'; then
-    echo "== pod deletes itself after ${MAX_HOURS}h if this machine loses it"
-else
+step "pod reachable at $ip:$port"
+if ! on_pod 'tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_API_KEY=." && tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_POD_ID=."'; then
     echo "remote-build.sh: warning: Runpod gave the pod no API key, so it cannot delete itself; a pod orphaned by this machine going down keeps billing" >&2
 fi
 
-echo "== checkout + provision"
+step "checkout"
 on_pod_script "$ROOT" "$fork_url" "$sha" <<'EOF'
 set -euo pipefail
 mkdir -p "$1" && cd "$1"
@@ -163,7 +212,7 @@ EOF
 git diff --name-only -z HEAD --diff-filter=d >"$tmp/changed"
 git ls-files -z -o --exclude-standard >>"$tmp/changed"
 if [[ -s $tmp/changed ]]; then
-    echo "== syncing $(tr -cd '\0' <"$tmp/changed" | wc -c) uncommitted files"
+    step "syncing $(tr -cd '\0' <"$tmp/changed" | wc -c) uncommitted files"
     rsync -az --from0 --files-from="$tmp/changed" -e "ssh ${ssh_opts[*]}" ./ "root@$ip:$ROOT/"
 fi
 deleted=$(git diff --name-only HEAD --diff-filter=D)
@@ -171,23 +220,36 @@ if [[ -n $deleted ]]; then
     printf '%s\n' "$deleted" | on_pod "cd '$ROOT' && xargs -d '\n' rm -f --"
 fi
 
-on_pod_script "$ROOT" "$deps_url" <<'EOF'
+step "waiting for provisioning and caches"
+on_pod_script "$ROOT" "$provision_url" <<'EOF'
 set -euo pipefail
-cd "$1"
-bash scripts/ubuntu2604/provision.sh >/root/provision.log 2>&1 || { tail -50 /root/provision.log; exit 1; }
-if [[ -n $2 ]]; then
-    mkdir -p deps/build
-    curl -fsSL "$2" | zstd -dc | tar -x -C deps/build
+root=$1 provision_url=$2
+cd "$root"
+wait_for() { # wait_for FILE: up to 20 minutes, for the pod's start command
+    local i
+    for ((i = 0; i < 1200; i++)); do [[ -f $1 ]] && return 0; sleep 1; done
+    echo "timed out waiting for $1" >&2
+    return 1
+}
+if [[ -n $provision_url ]]; then
+    wait_for /root/provision.rc || { tail -50 /root/provision.log; exit 1; }
+    rc=$(cat /root/provision.rc)
+else
+    rc=0
+    bash scripts/ubuntu2604/provision.sh >/root/provision.log 2>&1 || rc=$?
 fi
+[[ $rc == 0 ]] || { tail -50 /root/provision.log; exit 1; }
+wait_for /root/cache.done
 EOF
 
+on_pod_script "$ROOT" "$deps_key" "${volume_id:+1}" <<'EOF' || { rc=$?; [[ $rc == 12 ]] && die "tests failed on the pod" 12; die "build failed on the pod" 11; }
+set -euo pipefail
+root=$1 deps_key=$2 volume=$3
+cd "$root"
+flags=-sitr
+[[ -f /root/deps.restored ]] || flags=-dsitr
 # Parallel jobs: the vCPUs the pod may use (cgroup quota, nproc shows the host), capped at
 # 2 GB of RAM per job (the heaviest libslic3r units need about that much).
-flags=$([[ -n $deps_url ]] && echo -sitr || echo -dsitr)
-echo "== build ($flags)"
-on_pod_script "$ROOT" "$flags" <<'EOF' || { rc=$?; [[ $rc == 12 ]] && die "tests failed on the pod" 12; die "build failed on the pod" 11; }
-set -euo pipefail
-cd "$1"
 cpus=$(nproc)
 read -r quota period </sys/fs/cgroup/cpu.max 2>/dev/null || quota=max
 [[ $quota != max ]] && cpus=$(( quota / period ))
@@ -197,27 +259,47 @@ limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
 jobs=$(( mem_kb / 1024 / 1024 / 2 ))
 (( jobs > cpus )) && jobs=$cpus
 (( jobs < 1 )) && jobs=1
-echo "cpus=$cpus mem=$(( mem_kb / 1024 / 1024 ))G jobs=$jobs"
+echo "cpus=$cpus mem=$(( mem_kb / 1024 / 1024 ))G jobs=$jobs flags=$flags"
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 CMAKE_BUILD_PARALLEL_LEVEL=$jobs
-./build_linux.sh "$2" || exit 11
+# ccache for the slicer and tests. pch_defines,time_macros: required with precompiled headers;
+# include_file_*: the fresh checkout gives every header a new mtime.
+export CCACHE_DIR=/root/.cache/ccache CCACHE_BASEDIR=$root CCACHE_NOHASHDIR=1 CCACHE_COMPILERCHECK=content CCACHE_MAXSIZE=8G \
+       CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime
+export ORCA_EXTRA_BUILD_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+ccache -z >/dev/null
+
+# Saved on failure too: a fix-and-retry build reuses everything that compiled. Nothing new
+# compiled (no misses): the stored archive is already current.
+save_caches() {
+    [[ -n $volume ]] || return 0
+    ccache -s | grep -m2 -E '^ *(Hits|Misses):' || true
+    if [[ $(ccache --print-stats | awk '$1 == "cache_miss" { print $2 }') != 0 ]]; then
+        ccache --evict-older-than 14d >/dev/null || true
+        tar -C /root/.cache -cf - ccache | zstd -T0 -3 -q -o /workspace/ccache.tar.zst.$$ &&
+            mv /workspace/ccache.tar.zst.$$ /workspace/ccache.tar.zst ||
+            echo "remote-build.sh: warning: could not save the ccache to the volume" >&2
+    fi
+    [[ ! -f $root/build/.ninja_log ]] || { cp "$root/build/.ninja_log" /workspace/ninja_log.$$ && mv /workspace/ninja_log.$$ /workspace/ninja_log; } ||
+        echo "remote-build.sh: warning: could not save the ninja log to the volume" >&2
+}
+trap save_caches EXIT
+
+echo "== [$(date +%T)] build_linux.sh $flags"
+./build_linux.sh "$flags" || exit 11
+if [[ $flags == -dsitr && -n $deps_key && -n $volume ]]; then
+    echo "== caching dependencies $deps_key"
+    mkdir -p /workspace/deps
+    tar -C deps/build -cf - destdir | zstd -T0 -10 -q -o "/workspace/deps/$deps_key.tar.zst.$$"
+    mv "/workspace/deps/$deps_key.tar.zst.$$" "/workspace/deps/$deps_key.tar.zst"
+    find /workspace/deps -name '*.tar.zst' ! -name "$deps_key.tar.zst" -mtime +30 -delete
+fi
 # build_linux.sh builds only the Snapmaker_Orca target; -t merely configures the tests.
+echo "== [$(date +%T)] tests: build"
 cmake --build build --config Release || exit 11
-echo "== tests"
+echo "== [$(date +%T)] tests: run"
 cd build && ctest -C Release -j1 --output-on-failure || exit 12
 EOF
 
-echo "== fetching the AppImage"
+step "fetching the AppImage"
 rsync -a -e "ssh ${ssh_opts[*]}" "root@$ip:$ROOT/build/Snapmaker_Orca_Linux_V*.AppImage" build/
-
-if [[ -z $deps_url && -n $deps_tag ]]; then
-    echo "== caching dependencies as $deps_tag"
-    on_pod "tar -C '$ROOT/deps/build' -cf - destdir | zstd -T0 -q -10 -o /root/destdir.tar.zst"
-    rsync -a -e "ssh ${ssh_opts[*]}" "root@$ip:/root/destdir.tar.zst" "$tmp/"
-    gh release view "$deps_tag" --repo "$FORK_REPO" >/dev/null 2>&1 ||
-        gh release create "$deps_tag" --repo "$FORK_REPO" --prerelease --target "$sha" \
-            --title "Build dependencies $deps_tag (internal)" \
-            --notes "Prebuilt deps/build/destdir for scripts/ubuntu2604/remote-build.sh. Not a slicer release."
-    gh release upload "$deps_tag" --repo "$FORK_REPO" --clobber "$tmp/destdir.tar.zst" ||
-        echo "remote-build.sh: deps cache upload failed; the next build rebuilds them" >&2
-fi
-echo "== done: $(ls build/Snapmaker_Orca_Linux_V*.AppImage)"
+step "done: $(ls build/Snapmaker_Orca_Linux_V*.AppImage)"
