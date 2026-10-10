@@ -23,6 +23,9 @@ set -euo pipefail
 HERE=$(dirname "$(readlink -f "$0")")
 ROOT=$(git -C "$HERE" rev-parse --show-toplevel)
 cd "$ROOT"
+# The pod builds at the main checkout's path even when this runs from a linked worktree: cached
+# dependencies embed absolute paths (wx-config is a symlink into deps/build/destdir).
+POD_ROOT=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 
 FORK_REPO=${FORK_REPO:-alex-mextner/SnapOrca}
 FLAVORS=${RUNPOD_CPU_FLAVORS:-cpu5c,cpu3c} # compute-optimized, 2 GB RAM per vCPU
@@ -143,7 +146,7 @@ exec /usr/sbin/sshd -D -e
 EOF
 )
 pod_request() { # pod_request VOLUME_ID FLAVOR: the create body, without a volume when VOLUME_ID is empty
-    python3 - "$2" "$VCPU" "$((MAX_HOURS * 3600))" "$(cat "$SSH_KEY.pub")" "$boot" "$ROOT" "$deps_key" "$provision_url" \
+    python3 - "$2" "$VCPU" "$((MAX_HOURS * 3600))" "$(cat "$SSH_KEY.pub")" "$boot" "$POD_ROOT" "$deps_key" "$provision_url" \
         "$1" "$VOLUME_DC" <<'EOF'
 import json, sys
 flavor, vcpu, max_seconds, pubkey, boot, root, deps_key, provision_url, volume, dc = sys.argv[1:]
@@ -212,7 +215,7 @@ if ! on_pod 'tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_API_KEY=." && tr "
 fi
 
 step "checkout"
-on_pod_script "$ROOT" "$fork_url" "$sha" <<'EOF'
+on_pod_script "$POD_ROOT" "$fork_url" "$sha" <<'EOF'
 set -euo pipefail
 mkdir -p "$1" && cd "$1"
 git init -q && git fetch -q --depth 1 "$2" "$3" && git checkout -q FETCH_HEAD
@@ -223,15 +226,15 @@ git diff --name-only -z HEAD --diff-filter=d >"$tmp/changed"
 git ls-files -z -o --exclude-standard >>"$tmp/changed"
 if [[ -s $tmp/changed ]]; then
     step "syncing $(tr -cd '\0' <"$tmp/changed" | wc -c) uncommitted files"
-    rsync -az --from0 --files-from="$tmp/changed" -e "ssh ${ssh_opts[*]}" ./ "root@$ip:$ROOT/"
+    rsync -az --from0 --files-from="$tmp/changed" -e "ssh ${ssh_opts[*]}" ./ "root@$ip:$POD_ROOT/"
 fi
 deleted=$(git diff --name-only HEAD --diff-filter=D)
 if [[ -n $deleted ]]; then
-    printf '%s\n' "$deleted" | on_pod "cd '$ROOT' && xargs -d '\n' rm -f --"
+    printf '%s\n' "$deleted" | on_pod "cd '$POD_ROOT' && xargs -d '\n' rm -f --"
 fi
 
 step "waiting for provisioning and caches"
-on_pod_script "$ROOT" "$provision_url" <<'EOF'
+on_pod_script "$POD_ROOT" "$provision_url" <<'EOF'
 set -euo pipefail
 root=$1 provision_url=$2
 cd "$root"
@@ -252,7 +255,7 @@ fi
 wait_for /root/cache.done
 EOF
 
-on_pod_script "$ROOT" "$deps_key" "${volume_id:+1}" "${REMOTE_EXTRA_CMD:-}" "$(field memoryInGb <<<"$pod")" <<'EOF' || { rc=$?; [[ $rc == 12 ]] && die "tests failed on the pod" 12; die "build failed on the pod" 11; }
+on_pod_script "$POD_ROOT" "$deps_key" "${volume_id:+1}" "${REMOTE_EXTRA_CMD:-}" "$(field memoryInGb <<<"$pod")" <<'EOF' || { rc=$?; [[ $rc == 12 ]] && die "tests failed on the pod" 12; die "build failed on the pod" 11; }
 set -euo pipefail
 root=$1 deps_key=$2 volume=$3 extra_cmd=$4 pod_mem_gb=${5%%.*}
 cd "$root"
@@ -318,5 +321,5 @@ fi
 EOF
 
 step "fetching the AppImage"
-rsync -a -e "ssh ${ssh_opts[*]}" "root@$ip:$ROOT/build/Snapmaker_Orca_Linux_V*.AppImage" build/
+rsync -a -e "ssh ${ssh_opts[*]}" "root@$ip:$POD_ROOT/build/Snapmaker_Orca_Linux_V*.AppImage" build/
 step "done: $(ls build/Snapmaker_Orca_Linux_V*.AppImage)"
